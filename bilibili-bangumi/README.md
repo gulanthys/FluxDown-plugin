@@ -4,13 +4,14 @@
 
 ## 功能
 
-- 支持 Bilibili 番剧播放页：`/bangumi/play/ss...`
+- 支持 Bilibili 番剧播放页：`/bangumi/play/ss...` 和 `/bangumi/play/ep...`
 - 支持 Bilibili 番剧媒体页：`/bangumi/media/md...`
 - 支持移动端 Bilibili 番剧链接
 - 自动发现正片分集，并按集生成下载任务
 - 可选发现番外、PV、采访等分区
 - 支持 DASH 视频画质选择：最佳、2160p、1440p、1080p、720p、480p
 - 支持仅下载音频（M4A）
+- 每个可用画质会生成独立下载条目，名称保持视频原名并追加画质（例如 [1080p-高清]）
 - 优先使用高质量音频轨道，并将视频与音频交给 FluxDown 合并下载流程
 - 支持浏览器 Cookie 头和 Netscape `cookies.txt` 格式
 - 显式输入的 Cookie 会规范化并缓存，后续解析可以复用已保存登录态
@@ -18,7 +19,7 @@
 
 ## 系统要求
 
-- FluxDown `0.1.44` 或更高版本
+- FluxDown `0.1.64` 或更高版本
 - 能够访问 `api.bilibili.com`
 - 需要登录权限的内容必须提供有效的 Bilibili Cookie
 
@@ -28,7 +29,7 @@
 
 当前 Flutter 客户端的“通过 ZIP 安装”文件选择器只显示 `.zip` 文件。`.fxplug` 本质上是 ZIP 包，因此可以：
 
-1. 将 `bilibili-bangumi-0.1.0.fxplug` 重命名为 `bilibili-bangumi-0.1.0.zip`。
+1. 将 `bilibili-bangumi-0.1.6.fxplug` 重命名为 `bilibili-bangumi-0.1.6.zip`。
 2. 打开 FluxDown 的“设置 → 扩展 → 插件”。
 3. 点击“通过 ZIP 安装”，选择重命名后的文件。
 4. 安装成功后，在已安装插件列表中确认并启用插件。
@@ -86,7 +87,7 @@ Cookie 只应从自己的浏览器登录态导出，不要提交到 Git 仓库�
 
 依次检查：
 
-- FluxDown 版本是否至少为 `0.1.44`；
+- FluxDown 版本是否至少为 `0.1.64`；
 - 插件是否已启用；
 - Bilibili 链接是否为番剧播放页或媒体页；
 - Bilibili Cookie 是否有效，是否有对应内容的访问权限；
@@ -107,5 +108,4 @@ Bilibili 返回的画质取决于账号权限、视频本身和当前播放接�
 
 ## 版本
 
-当前版本：`0.1.0`
-
+当前版本：`0.1.2`

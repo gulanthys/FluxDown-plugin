@@ -37,7 +37,7 @@ FluxDown-plugin/
 
 | 插件 | FluxDown identity | 版本 | 功能 |
 | --- | --- | --- | --- |
-| [bilibili-bangumi](./bilibili-bangumi/) | `fluxdown@bilibili-bangumi` | `0.1.0` | 发现 Bilibili 番剧分集并解析视频、音频直链 |
+| [bilibili-bangumi](./bilibili-bangumi/) | `fluxdown@bilibili-bangumi` | `0.1.2` | 发现 Bilibili 番剧分集并解析视频、音频直链 |
 
 ## 插件包格式
 
@@ -101,4 +101,3 @@ plugin.fxplug
 - [ ] Cookie、Token 和本机路径未进入源码或发布包。
 - [ ] 已通过开发目录安装和 `.fxplug` 安装验证。
 - [ ] 插件 README 已同步更新。
-

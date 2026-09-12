@@ -1,8 +1,8 @@
 {
   "identity": "fluxdown@bilibili-bangumi",
   "name": "Bilibili 番剧分集下载",
-  "version": "0.1.0",
-  "description": "独立的 B 站番剧插件：从番剧链接读取正片分集清单，按集解析真实视频流并交回 FluxDown 下载。",
+  "version": "0.1.2",
+  "description": "独立的 B 站番剧插件：支持 ss/ep 番剧链接，将每个可用画质展开为独立下载条目并写入文件名。",
   "homepage": "https://github.com/gulanthys/FluxDown-plugin",
   "minAppVersion": "0.1.44",
   "resolvers": [
@@ -10,15 +10,18 @@
       "match": {
         "urls": [
           "*://www.bilibili.com/bangumi/play/ss*",
+          "*://www.bilibili.com/bangumi/play/ep*",
           "*://bilibili.com/bangumi/play/ss*",
+          "*://bilibili.com/bangumi/play/ep*",
           "*://m.bilibili.com/bangumi/play/ss*",
+          "*://m.bilibili.com/bangumi/play/ep*",
           "*://www.bilibili.com/bangumi/media/md*",
           "*://bilibili.com/bangumi/media/md*",
           "*://m.bilibili.com/bangumi/media/md*"
         ]
       },
       "entry": "resolve.js",
-      "timeoutMs": 45000,
+      "timeoutMs": 30000,
       "multi": true
     }
   ],

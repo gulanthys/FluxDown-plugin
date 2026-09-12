@@ -3,7 +3,7 @@
   "name": "Bilibili 番剧分集下载",
   "version": "0.1.0",
   "description": "独立的 B 站番剧插件：从番剧链接读取正片分集清单，按集解析真实视频流并交回 FluxDown 下载。",
-  "homepage": "https://fluxdown.zerx.dev",
+  "homepage": "https://github.com/gulanthys/FluxDown-plugin",
   "minAppVersion": "0.1.44",
   "resolvers": [
     {

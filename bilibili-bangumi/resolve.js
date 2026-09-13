@@ -195,6 +195,22 @@ function episodeLabel(ep) {
   return longTitle && longTitle !== index ? index + ' ' + longTitle : index;
 }
 
+function episodePageUrl(epId, ep) {
+  var id = String(epId || (ep && (ep.id || ep.ep_id)) || '');
+  return id ? 'https://www.bilibili.com/bangumi/play/ep' + encodeURIComponent(id) : '';
+}
+
+function episodePubDate(ep) {
+  var raw = ep && (ep.pub_time || ep.pubTime || ep.publish_time || 0);
+  var numeric = Number(raw);
+  if (Number.isFinite(numeric) && numeric > 0) {
+    if (numeric >= 100000000000) numeric /= 1000;
+    return Math.floor(numeric);
+  }
+  var parsed = Date.parse(String(raw || ''));
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed / 1000) : 0;
+}
+
 function episodePlayUrl(epId, qualityId) {
   var qn = Number(qualityId) || 127;
   return '/pgc/player/web/playurl?ep_id=' + encodeURIComponent(epId) +
@@ -202,6 +218,12 @@ function episodePlayUrl(epId, qualityId) {
     '&fnval=4048&fourk=1&fnver=0&otype=json&platform=web';
 }
 
+function subscriptionPlayUrl(epId, qualityId) {
+  var qn = Number(qualityId) || 127;
+  return '/pgc/player/web/playurl?ep_id=' + encodeURIComponent(epId) +
+    '&qn=' + encodeURIComponent(qn) +
+    '&fnval=0&fourk=1&fnver=0&otype=json&platform=web';
+}
 function qualityHeight(qualityId) {
   return QUALITY_HEIGHT_BY_ID[Number(qualityId) || 0] || 0;
 }
@@ -354,7 +376,7 @@ async function resolveEpisode(ctx) {
   var episode = findEpisode(season, epId);
   // 清单项带有具体画质码时，下载阶段直接请求该 qn；
   // qn=127 只用于列出可选画质，不能保证每次都返回同一条资源。
-  var requestedQualityId = /^\\d+$/.test(qualityKey) ? Number(qualityKey) : 0;
+  var requestedQualityId = /^\d+$/.test(qualityKey) ? Number(qualityKey) : 0;
   var play = null;
   if (requestedQualityId) {
     try {
@@ -695,7 +717,182 @@ function chooseDashIndex(variants, quality) {
   return best;
 }
 
+
+// 订阅轮询会直接为条目建任务，单次只解析最近一批分集，避免长篇番剧或大量番外
+// 让一次订阅调用超过宿主的墙钟预算。核心会保留已知 guid，后续轮询继续尝试最新分集。
+var MAX_SUBSCRIPTION_EPISODES = 50;
+
+function subscriptionItemTitle(seriesTitle, name, variant) {
+  var label = String(variant && variant.label || '').trim();
+  if (!label || label === 'quality-unknown') {
+    var height = Number(variant && variant.height) || 0;
+    label = height ? height + 'p' : 'unknown-quality';
+    var qualityId = Number(variant && variant.qualityId) || 0;
+    if (qualityId) label += ' [qn' + qualityId + ']';
+  }
+  var sourceName = String(variant && variant.fileName || '');
+  var extensionMatch = /\.([a-z0-9]{1,8})$/i.exec(sourceName);
+  var extension = extensionMatch ? extensionMatch[1].toLowerCase() : 'mp4';
+  return sanitizeFileName(seriesTitle + ' - ' + name + ' [' + label + '].' + extension);
+}
+
+function subscriptionEpisodeGroups(result, includeExtras) {
+  var groups = [];
+  if (Array.isArray(result.episodes)) groups.push({ title: '正片', episodes: result.episodes });
+  if (includeExtras && Array.isArray(result.section)) {
+    for (var i = 0; i < result.section.length; i++) {
+      var section = result.section[i];
+      if (section && Array.isArray(section.episodes)) {
+        groups.push({ title: section.title || '番外', episodes: section.episodes });
+      }
+    }
+  }
+  return groups;
+}
+
+function subscriptionQualityCandidates(play, title) {
+  var candidates = [];
+  var seen = {};
+  var dash = play && play.dash ? play.dash : {};
+  var videos = Array.isArray(dash.video) ? dash.video : [];
+  var audio = pickAudioTrack(Array.isArray(dash.audio) ? dash.audio : []);
+  // 直接遍历 DASH 视频列表，不经过普通解析的画质上限，保留接口返回的每一个质量码。
+  for (var vi = 0; vi < videos.length; vi++) {
+    var video = videos[vi] || {};
+    var qualityId = Number(video.id) || Number(video.quality) || 0;
+    var height = videoHeight(video);
+    if (!qualityId || !height || seen[qualityId]) continue;
+    seen[qualityId] = true;
+    candidates.push({
+      qualityId: qualityId,
+      height: height,
+      label: videoQualityLabel(video, height, play),
+      totalBytes: streamSize(video) + streamSize(audio),
+    });
+  }
+  // 非 DASH 响应（或接口裁剪了 video 列表）仍尝试使用封装流中的画质。
+  if (!candidates.length) {
+    var variants = buildVariantsFromPlay(play, title);
+    for (var i = 0; i < variants.length; i++) {
+      var variant = variants[i];
+      var variantQualityId = Number(variant && variant.qualityId) || 0;
+      var variantHeight = Number(variant && variant.height) || 0;
+      if (!variantQualityId || !variantHeight || seen[variantQualityId]) continue;
+      seen[variantQualityId] = true;
+      candidates.push({
+        qualityId: variantQualityId,
+        height: variantHeight,
+        label: variant.label,
+        totalBytes: Number(variant.totalBytes) > 0 ? Number(variant.totalBytes) : 0,
+      });
+    }
+  }
+  // 某些接口只返回 accept_quality，不返回完整 DASH 列表；继续补齐账号可用画质。
+  var accepted = play && play.accept_quality;
+  if (Array.isArray(accepted)) {
+    for (var ai = 0; ai < accepted.length; ai++) {
+      var acceptedId = Number(accepted[ai]) || 0;
+      if (!acceptedId || seen[acceptedId]) continue;
+      var acceptedHeight = qualityHeight(acceptedId);
+      if (!acceptedHeight) continue;
+      seen[acceptedId] = true;
+      candidates.push({ qualityId: acceptedId, height: acceptedHeight, label: '', totalBytes: 0 });
+    }
+  }
+  return candidates;
+}
+async function subscribeBangumi(ctx) {
+  var cookie = await effectiveCookie(ctx);
+  var seasonId = await seasonIdFromUrl(ctx.url, ctx, cookie);
+  if (!seasonId) throw new Error('无法从 Bilibili 番剧链接识别 season_id 或 media_id');
+
+  var result = await apiGet(
+    '/pgc/view/web/season?season_id=' + encodeURIComponent(seasonId),
+    ctx,
+    cookie
+  );
+  var title = sanitizeFileName(result.title || result.season_title || ('Bilibili ' + seasonId));
+  var episodes = [];
+  var seen = {};
+  var groups = subscriptionEpisodeGroups(result, Boolean(setting('includeExtras', false)));
+  for (var gi = 0; gi < groups.length; gi++) {
+    var group = groups[gi];
+    for (var ei = 0; ei < group.episodes.length; ei++) {
+      var episode = group.episodes[ei] || {};
+      var epId = String(episode.id || episode.ep_id || '');
+      if (!epId || seen[epId]) continue;
+      seen[epId] = true;
+      episodes.push({
+        id: epId,
+        episode: episode,
+        name: sanitizeFileName(episodeLabel(episode)),
+      });
+    }
+  }
+  if (episodes.length > MAX_SUBSCRIPTION_EPISODES) {
+    episodes = episodes.slice(-MAX_SUBSCRIPTION_EPISODES);
+  }
+  if (!episodes.length) throw new Error('Bilibili 未返回可订阅分集');
+
+  // 订阅条目沿用直接下载的 DASH 画质集合；实际下载时由核心把
+  // resolverItem 传回本插件二段解析，以复用视频轨 + 音频轨合并逻辑。
+  var items = new Array(episodes.length);
+  var nextIndex = 0;
+  async function worker() {
+    while (true) {
+      var index = nextIndex++;
+      if (index >= episodes.length) return;
+      var current = episodes[index];
+      try {
+        var play = await apiGet(episodePlayUrl(current.id), ctx, cookie);
+        var candidates = subscriptionQualityCandidates(play, current.name);
+        for (var qi = 0; qi < candidates.length; qi++) {
+          var candidate = candidates[qi];
+          var qualityKey = String(candidate.qualityId);
+          var displayVariant = {
+            label: candidate.label,
+            qualityId: candidate.qualityId,
+            height: candidate.height,
+            fileName: current.name + '.mp4',
+          };
+          var item = {
+            guid: 'ep:' + current.id + '@q:' + qualityKey,
+            title: subscriptionItemTitle(title, current.name, displayVariant),
+            link: episodePageUrl(current.id, current.episode),
+            enclosureUrl: '',
+            enclosureLength: Number(candidate.totalBytes) > 0 ? Number(candidate.totalBytes) : 0,
+            pubDate: episodePubDate(current.episode),
+            resolverItem: 'ep:' + current.id + '@q:' + qualityKey,
+          };
+          if (!items[index]) items[index] = [];
+          items[index].push(item);
+        }
+      } catch (e) {
+        // 单集暂时不可访问时跳过；下一次轮询会重新尝试全部画质。
+      }
+    }
+  }  var workers = Math.min(6, episodes.length);
+  var jobs = [];
+  for (var wi = 0; wi < workers; wi++) jobs.push(worker());
+  await Promise.all(jobs);
+
+  var ready = [];
+  for (var ri = 0; ri < items.length; ri++) {
+    if (items[ri]) {
+      for (var ii = 0; ii < items[ri].length; ii++) ready.push(items[ri][ii]);
+    }
+  }
+  if (!ready.length) throw new Error('Bilibili 分集均未返回可下载的单文件直链');
+  return {
+    title: title,
+    link: ctx.url,
+    items: ready,
+  };
+}
+
 globalThis.resolve = async (ctx) => {
   if (ctx.resolverItem) return await resolveEpisode(ctx);
   return await resolveManifest(ctx);
 };
+
+globalThis.subscribe = async (ctx) => await subscribeBangumi(ctx);

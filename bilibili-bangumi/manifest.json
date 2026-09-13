@@ -1,9 +1,9 @@
 {
   "identity": "fluxdown@bilibili-bangumi",
   "name": "Bilibili 番剧分集下载",
-  "version": "0.1.2",
-  "description": "独立的 B 站番剧插件：支持 ss/ep 番剧链接，将每个可用画质展开为独立下载条目并写入文件名。",
-  "homepage": "https://github.com/gulanthys/FluxDown-plugin",
+  "version": "0.1.3",
+  "description": "独立的 B 站番剧插件：支持 ss/ep 番剧链接、番剧订阅，将每个可用画质展开为独立下载条目。",
+  "homepage": "https://github.com/gulanthys",
   "minAppVersion": "0.1.44",
   "resolvers": [
     {
@@ -23,6 +23,13 @@
       "entry": "resolve.js",
       "timeoutMs": 30000,
       "multi": true
+    }
+  ],
+  "subscriptions": [
+    {
+      "providerId": "bilibili-bangumi",
+      "entry": "resolve.js",
+      "timeoutMs": 30000
     }
   ],
   "settings": [
@@ -53,7 +60,7 @@
     {
       "key": "quality",
       "title": "默认画质",
-      "description": "无人值守或选择框超时时使用的画质；手动下载仍可在变体列表中选择。",
+      "description": "普通链接无人值守或选择框超时时使用的画质；番剧订阅返回全部可用画质，请用订阅过滤选择。",
       "type": "string",
       "widget": "select",
       "options": [

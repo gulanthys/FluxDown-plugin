@@ -14,6 +14,10 @@ var USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
 var MAX_EPISODES = 1000;
 var MAX_VARIANTS = 8;
 var AUTH_COOKIE_KEY = 'auth.cookie';
+var BFE_ID_KEY = 'auth.bfe_id';
+// bili32 使用通用播放器接口时携带的 session 参数；番剧分集也能通过
+// bvid + cid 走同一接口，并返回完整的 DASH 画质列表。
+var PLAYER_SESSION = '68191c1dc3c75042c6f35fba895d65b0';
 
 // DASH 返回的 height 通常存在，但部分接口/账号组合只返回画质码 id。
 // 这些是 Bilibili Web 播放接口常见的画质码，作为 height 缺失时的回退。
@@ -87,16 +91,46 @@ async function effectiveCookie(ctx) {
       var previous = await flux.storage.get(AUTH_COOKIE_KEY);
       if (previous !== cookie) await flux.storage.set(AUTH_COOKIE_KEY, cookie);
     } catch (e) {}
-    return cookie;
+    return await appendStoredBfeId(cookie);
   }
 
   if (setting('reuseStoredSession', true)) {
     try {
       var stored = await flux.storage.get(AUTH_COOKIE_KEY);
-      if (stored) return String(stored);
+      if (stored) return await appendStoredBfeId(String(stored));
     } catch (e) {}
   }
   return '';
+}
+
+function cookieContains(cookie, name) {
+  return new RegExp('(?:^|;\\s*)' + String(name).replace(/[.*+?^${}()|[\\]\\]/g, '\\$&') + '=', 'i').test(String(cookie || ''));
+}
+
+async function appendStoredBfeId(cookie) {
+  var value = String(cookie || '').trim();
+  if (!value || cookieContains(value, 'bfe_id')) return value;
+  try {
+    var bfeId = await flux.storage.get(BFE_ID_KEY);
+    if (bfeId) return value + '; bfe_id=' + String(bfeId).trim();
+  } catch (e) {}
+  return value;
+}
+
+function responseHeader(response, name) {
+  var headers = response && response.headers ? response.headers : {};
+  var keys = Object.keys(headers);
+  for (var i = 0; i < keys.length; i++) {
+    if (keys[i].toLowerCase() === String(name).toLowerCase()) return String(headers[keys[i]] || '');
+  }
+  return '';
+}
+
+async function rememberResponseBfeId(response) {
+  var setCookie = responseHeader(response, 'set-cookie');
+  var match = /(?:^|[;\\n,]\\s*)bfe_id=([^;\\n,]+)/i.exec(setCookie);
+  if (!match || !match[1]) return;
+  try { await flux.storage.set(BFE_ID_KEY, match[1].trim()); } catch (e) {}
 }
 
 function hasHeader(headers, name) {
@@ -156,7 +190,9 @@ async function apiGet(path, ctx, cookie) {
       ': ' + String((payload && payload.message) || 'unknown')
     );
   }
-  return payload.result || {};
+  await rememberResponseBfeId(response);
+  // PGC 接口返回 result，通用播放器接口返回 data。
+  return payload.result || payload.data || {};
 }
 
 function firstMatch(url, pattern) {
@@ -216,6 +252,18 @@ function episodePlayUrl(epId, qualityId) {
   return '/pgc/player/web/playurl?ep_id=' + encodeURIComponent(epId) +
     '&qn=' + encodeURIComponent(qn) +
     '&fnval=4048&fourk=1&fnver=0&otype=json&platform=web';
+}
+
+function playerPlayUrl(episode, qualityId) {
+  var bvid = String(episode && (episode.bvid || episode.bv_id) || '');
+  var cid = String(episode && episode.cid || '');
+  var epId = String(episode && (episode.id || episode.ep_id) || '');
+  var qn = Number(qualityId) || 127;
+  if (!bvid || !cid) return episodePlayUrl(epId, qn);
+  return '/x/player/playurl?cid=' + encodeURIComponent(cid) +
+    '&bvid=' + encodeURIComponent(bvid) +
+    '&qn=' + encodeURIComponent(qn) +
+    '&type=&otype=json&fourk=1&fnver=0&fnval=80&session=' + PLAYER_SESSION;
 }
 
 function subscriptionPlayUrl(epId, qualityId) {
@@ -294,7 +342,13 @@ async function collectEpisodes(result, includeExtras, ctx, cookie, quality) {
       var id = String(ep.id || ep.ep_id || '');
       if (!id || seen[id]) continue;
       seen[id] = true;
-      episodes.push({ id: id, baseName: sanitizeFileName(episodeLabel(ep)), path: group.title === '正片' ? '' : sanitizePath(group.title) });
+      episodes.push({
+        id: id,
+        bvid: ep.bvid || ep.bv_id || '',
+        cid: ep.cid || '',
+        baseName: sanitizeFileName(episodeLabel(ep)),
+        path: group.title === '正片' ? '' : sanitizePath(group.title),
+      });
       if (episodes.length >= MAX_EPISODES) break;
     }
     if (episodes.length >= MAX_EPISODES) break;
@@ -312,9 +366,9 @@ async function collectEpisodes(result, includeExtras, ctx, cookie, quality) {
       var index = nextIndex++;
       if (index >= hintLimit) return;
       try {
-        var play = await apiGet(episodePlayUrl(episodes[index].id), ctx, cookie);
+        var play = await apiGet(playerPlayUrl(episodes[index]), ctx, cookie);
         var variants = buildVariantsFromPlay(play, 'quality');
-        qualityVariants[index] = await filterUnavailablePremiumVariants(episodes[index].id, variants, ctx, cookie);
+        qualityVariants[index] = await filterUnavailablePremiumVariants(episodes[index], variants, ctx, cookie);
       } catch (e) { qualityVariants[index] = []; }
     }
   }
@@ -380,12 +434,12 @@ async function resolveEpisode(ctx) {
   var play = null;
   if (requestedQualityId) {
     try {
-      play = await apiGet(episodePlayUrl(epId, requestedQualityId), ctx, cookie);
+      play = await apiGet(playerPlayUrl({ id: epId, bvid: episode && episode.bvid, cid: episode && episode.cid }, requestedQualityId), ctx, cookie);
     } catch (e) {
       play = null;
     }
   }
-  if (!play) play = await apiGet(episodePlayUrl(epId), ctx, cookie);
+  if (!play) play = await apiGet(playerPlayUrl({ id: epId, bvid: episode && episode.bvid, cid: episode && episode.cid }), ctx, cookie);
   if (play.code != null && Number(play.code) !== 0) {
     throw new Error('Bilibili 播放接口错误 code=' + String(play.code));
   }
@@ -679,7 +733,7 @@ function playHasQuality(play, qualityId) {
   return false;
 }
 
-async function filterUnavailablePremiumVariants(epId, variants, ctx, cookie) {
+async function filterUnavailablePremiumVariants(episode, variants, ctx, cookie) {
   var kept = [];
   for (var i = 0; i < variants.length; i++) {
     var variant = variants[i];
@@ -688,7 +742,7 @@ async function filterUnavailablePremiumVariants(epId, variants, ctx, cookie) {
       continue;
     }
     try {
-      var exactPlay = await apiGet(episodePlayUrl(epId, variant.qualityId), ctx, cookie);
+      var exactPlay = await apiGet(playerPlayUrl(episode, variant.qualityId), ctx, cookie);
       if (playHasQuality(exactPlay, variant.qualityId)) kept.push(variant);
     } catch (e) {}
   }
@@ -844,7 +898,7 @@ async function subscribeBangumi(ctx) {
       if (index >= episodes.length) return;
       var current = episodes[index];
       try {
-        var play = await apiGet(episodePlayUrl(current.id), ctx, cookie);
+        var play = await apiGet(playerPlayUrl(current.episode), ctx, cookie);
         var candidates = subscriptionQualityCandidates(play, current.name);
         for (var qi = 0; qi < candidates.length; qi++) {
           var candidate = candidates[qi];

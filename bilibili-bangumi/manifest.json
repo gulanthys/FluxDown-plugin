@@ -1,7 +1,7 @@
 {
   "identity": "fluxdown@bilibili-bangumi",
   "name": "Bilibili 番剧分集下载",
-  "version": "0.1.4",
+  "version": "0.1.14",
   "description": "独立的 B 站番剧插件：支持番剧链接、番剧订阅、二维码登录及登录态复用。",
   "homepage": "https://github.com/gulanthys",
   "minAppVersion": "0.1.44",
@@ -29,6 +29,13 @@
       "multi": true
     }
   ],
+  "subscriptions": [
+    {
+      "providerId": "bilibili-bangumi",
+      "entry": "resolve.js",
+      "timeoutMs": 30000
+    }
+  ],
   "settings": [
     {
       "key": "cookies",
@@ -49,7 +56,15 @@
     {
       "key": "includeExtras",
       "title": "包含番外与花絮",
-      "description": "关闭时只列出正片；开启后同时列出 PV、采访和其他分区。",
+      "description": "关闭时只列出正片并排除预告；开启后同时列出预告、PV、采访和其他分区。",
+      "type": "boolean",
+      "widget": "toggle",
+      "default": "false"
+    },
+    {
+      "key": "highestQualityOnly",
+      "title": "优先最高画质",
+      "description": "开启后每集只展示最高可用画质，避免长番剧画质条目超过宿主清单上限；关闭后展示全部可用画质。",
       "type": "boolean",
       "widget": "toggle",
       "default": "false"

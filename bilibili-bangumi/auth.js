@@ -89,7 +89,16 @@ function decode(value) {
 
 function decodeCookie(value) {
   // Cookie 值中的 + 是字面量，不能按 querystring 的空格规则处理。
-  try { return decodeURIComponent(String(value || '')); } catch (e) { return String(value || ''); }
+  // Cookie header values must be preserved verbatim. In particular, Bilibili
+  // expects SESSDATA's %2C and %2A escapes to remain encoded.
+  return String(value || '').trim();
+}
+
+function cookieQueryValue(name, value) {
+  // SESSDATA can be embedded in a callback URL, where decoding it changes the
+  // value that Bilibili uses to determine the account's playback privileges.
+  if (String(name || '').toLowerCase() === 'sessdata') return String(value || '').trim();
+  return decode(value);
 }
 
 function cookieMap(cookie) {
@@ -133,7 +142,7 @@ function cookiesFromResult(result, existing) {
     while ((match = query.exec(url)) !== null) {
       var key = decode(match[1]);
       for (var n = 0; n < COOKIE_NAMES.length; n++) {
-        if (key === COOKIE_NAMES[n]) parts.push(key + '=' + decode(match[2]));
+        if (key === COOKIE_NAMES[n]) parts.push(key + '=' + cookieQueryValue(key, match[2]));
       }
     }
   }

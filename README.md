@@ -37,7 +37,7 @@ FluxDown-plugin/
 
 | 插件 | FluxDown identity | 版本 | 功能 |
 | --- | --- | --- | --- |
-| [bilibili-bangumi](./bilibili-bangumi/) | `fluxdown@bilibili-bangumi` | `0.1.2` | 发现 Bilibili 番剧分集并解析视频、音频直链 |
+| [bilibili-bangumi](./bilibili-bangumi/) | `fluxdown@bilibili-bangumi` | `0.1.3` | 发现 Bilibili 番剧分集、解析视频音频直链，并提供番剧订阅 |
 
 ## 插件包格式
 
@@ -73,6 +73,7 @@ plugin.fxplug
 - `name`、`version`、`description`：插件展示信息；
 - `minAppVersion`：最低 FluxDown 版本；
 - `resolvers`：链接匹配规则、入口文件和解析超时时间；
+- `subscriptions`：订阅 provider ID、入口文件和订阅超时时间；
 - `settings`：插件可配置的设置项。
 
 插件入口应通过 FluxDown 插件运行时提供的能力完成网络请求、存储和结果返回，不应依赖宿主客户端内部文件路径或未声明的接口。

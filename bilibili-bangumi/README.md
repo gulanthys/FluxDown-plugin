@@ -1,4 +1,4 @@
-# Bilibili 番剧分集下载插件
+# Bilibili视频下载插件
 
 `fluxdown@bilibili-bangumi` 是一个面向 FluxDown 的 Bilibili 番剧解析插件。它会从 Bilibili 番剧页面读取分集列表，再为每一集解析 DASH 视频和音频地址，交给 FluxDown 下载引擎处理。
 

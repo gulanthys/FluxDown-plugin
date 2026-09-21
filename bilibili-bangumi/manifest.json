@@ -1,8 +1,8 @@
 {
   "identity": "fluxdown@bilibili-bangumi",
   "name": "Bilibili视频下载",
-  "version": "0.1.14",
-  "description": "独立的 B 站番剧插件：支持番剧链接、番剧订阅、二维码登录及登录态复用。",
+  "version": "0.1.18",
+  "description": "Bilibili 视频插件：支持番剧、UP 主投稿订阅、DASH 解析、二维码登录及登录态复用。",
   "homepage": "https://github.com/gulanthys",
   "minAppVersion": "0.1.44",
   "permissions": ["auth"],

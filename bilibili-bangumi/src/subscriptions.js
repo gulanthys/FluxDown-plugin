@@ -63,7 +63,7 @@ function uploaderVideoUrl(bvid) { return 'https://www.bilibili.com/video/' + enc
 function videoPlayUrl(video, qualityId) {
   var qn = Number(qualityId) || 127;
   return '/x/player/playurl?bvid=' + encodeURIComponent(video.bvid) + '&cid=' + encodeURIComponent(video.cid) +
-    '&qn=' + encodeURIComponent(qn) + '&fnval=4048&fourk=1&fnver=0&otype=json&platform=html5';
+    '&qn=' + encodeURIComponent(qn) + '&fnval=4048&fourk=1&fnver=0&otype=json&platform=pc';
 }
 function uploaderVideoTitle(uploaderName, videoTitle, variant) {
   var label = String(variant && variant.label || '').trim() || 'unknown-quality';

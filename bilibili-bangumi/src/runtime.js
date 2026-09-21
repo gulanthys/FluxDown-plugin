@@ -39,6 +39,38 @@ function setting(name, fallback) {
   var value = flux.settings[name];
   return value == null ? fallback : value;
 }
+function pluginLog(level) {
+  try {
+    var logger = flux && flux.logger;
+    if (!logger || typeof logger[level] !== 'function') return;
+    var args = Array.prototype.slice.call(arguments, 1);
+    logger[level].apply(logger, args);
+  } catch (e) {}
+}
+
+function playQualityDiagnostics(play) {
+  var value = play || {};
+  var dash = value.dash && typeof value.dash === 'object' ? value.dash : {};
+  var videos = Array.isArray(dash.video) ? dash.video : [];
+  var formats = Array.isArray(value.support_formats) ? value.support_formats : [];
+  var quality = Array.isArray(value.accept_quality) ? value.accept_quality.map(function(item) { return Number(item) || item; }) : [];
+  var heights = videos.map(function(video) {
+    return { id: Number(video && (video.id || video.quality)) || 0, height: Number(video && (video.height || video.height_cm)) || 0, width: Number(video && video.width) || 0, codec: String(video && (video.codecs || video.codecs_name) || '') };
+  }).filter(function(item) { return item.id || item.height; });
+  heights.sort(function(a, b) { return b.height - a.height || b.id - a.id; });
+  return {
+    acceptQuality: quality,
+    supportFormats: formats.map(function(item) { return { quality: Number(item && (item.quality || item.quality_id)) || 0, format: String(item && (item.format || item.new_description || item.display_desc) || '') }; }),
+    dashVideo: heights.slice(0, 16),
+    dashMaxHeight: heights.reduce(function(max, item) { return Math.max(max, item.height); }, 0),
+    durlQuality: Number(value.quality) || 0
+  };
+}
+
+function logAuthDiagnostics(source, cookie, payload) {
+  var data = payload && payload.data ? payload.data : {};
+  pluginLog('info', '[bilibili] auth diagnostics', { source: source, hasSessdata: cookieContains(cookie, 'SESSDATA'), isLogin: data.isLogin === true, hasWbiImage: Boolean(data.wbi_img && data.wbi_img.img_url && data.wbi_img.sub_url) });
+}
 
 function sanitizeFileName(name) {
   return (name || 'video')
@@ -86,6 +118,25 @@ function normalizeSessdataCookie(cookie) {
   });
 }
 
+async function cookieFromAuthProfile() {
+  if (!flux.auth || typeof flux.auth.get !== 'function') return '';
+  var refs = [];
+  try {
+    var raw = await flux.storage.get('auth.refs');
+    var parsed = raw ? JSON.parse(raw) : [];
+    if (Array.isArray(parsed)) refs = parsed.slice();
+  } catch (e) {}
+  if (!refs.length) refs.push('fluxdown@bilibili-bangumi::api.bilibili.com');
+  for (var i = 0; i < refs.length; i++) {
+    if (!refs[i]) continue;
+    try {
+      var profile = await flux.auth.get(String(refs[i]));
+      var profileCookie = cookieHeader(profile && profile.cookies || '');
+      if (/(?:^|;\s*)SESSDATA=/i.test(profileCookie)) return profileCookie;
+    } catch (e) {}
+  }
+  return '';
+}
 async function effectiveCookie(ctx) {
   var raw = String((ctx && ctx.cookies) || '').trim();
   if (!raw) raw = String(setting('cookies', '') || '').trim();
@@ -105,6 +156,11 @@ async function effectiveCookie(ctx) {
       var stored = await flux.storage.get(AUTH_COOKIE_KEY);
       if (stored) return await appendStoredBfeId(String(stored));
     } catch (e) {}
+    var profileCookie = await cookieFromAuthProfile();
+    if (profileCookie) {
+      try { await flux.storage.set(AUTH_COOKIE_KEY, profileCookie); } catch (e) {}
+      return await appendStoredBfeId(profileCookie);
+    }
   }
   return '';
 }
@@ -218,7 +274,14 @@ async function apiGet(path, ctx, cookie) {
   }
   await rememberResponseBfeId(response);
   // PGC 接口返回 result，通用播放器接口返回 data。
-  return payload.result || payload.data || {};
+  var result = payload.result || payload.data || {};
+  if (/\/playurl(?:\?|$)/.test(path)) {
+    pluginLog('info', '[bilibili] playurl diagnostics', {
+      hasSessdata: cookieContains(requestCookie, 'SESSDATA'),
+      diagnostics: playQualityDiagnostics(result),
+    });
+  }
+  return result;
 }
 
 function md5(input) {
@@ -313,6 +376,7 @@ async function apiGetPayload(path, ctx, cookie) {
     throw new Error('Bilibili 接口返回非法 JSON: ' + String(e));
   }
   await rememberResponseBfeId(response);
+  if (/\/x\/web-interface\/nav(?:\?|$)/.test(path)) logAuthDiagnostics('nav', requestCookie, payload);
   return payload;
 }
 

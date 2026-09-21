@@ -33,7 +33,7 @@
 当前 Flutter 客户端的“通过 ZIP 安装”文件选择器只显示 `.zip` 文件。发布包同时提供 `.zip` 和 `.fxplug`，直接选择 `.zip` 安装即可：
 
 1. 打开 FluxDown 的“设置 → 扩展 → 插件”。
-2. 点击“通过 ZIP 安装”，选择 `bilibili-bangumi-0.1.14.zip`。
+2. 点击“通过 ZIP 安装”，选择 `bilibili-bangumi-1.0.0.zip`。
 3. 安装成功后，在已安装插件列表中确认并启用插件。
 
 不要先解压再通过 ZIP 安装。插件包根目录必须直接包含：
@@ -139,4 +139,30 @@ Bilibili 返回的画质取决于账号权限、视频本身和当前播放接�
 
 ## 版本
 
-当前版本：`0.1.14`
+当前版本：`1.0.0`
+
+## UP 主投稿订阅
+
+在 RSS/订阅向导中选择 bilibili-bangumi，地址填写 UP 主空间，例如：
+
+https://space.bilibili.com/123456
+
+插件每轮读取最新普通投稿，固定读取最新 20 条，并为每个视频选择最高可用画质后按 bvid + cid 生成稳定条目；核心负责轮询和去重。直播回放、合集订阅和高级关键词过滤暂不属于第一版范围。 投稿列表使用 Bilibili WBI 签名接口；插件会缓存并自动刷新 WBI key，登录 Cookie 继续复用现有设置。
+
+## 源码结构
+
+运行时入口仍是根目录的 `resolve.js`，源码按职责拆分在 `src/`：
+
+- `runtime.js`：插件运行时、Cookie、HTTP 和 Bilibili API 基础能力
+- `bangumi.js`：番剧分集发现和番剧单集解析
+- `dash.js`：DASH、音频轨、画质和下载结果处理
+- `subscriptions.js`：番剧订阅和 UP 主投稿订阅
+- `entry.js`：对 FluxDown 暴露的 `resolve` 和 `subscribe` 入口
+
+修改源码后，在插件目录执行：
+
+```text
+node scripts/build.mjs
+```
+
+该命令会重新生成根目录的 `resolve.js`，安装插件时仍使用 `manifest.json` 声明的入口。

@@ -17,7 +17,10 @@ FluxDown-plugin/
 └── bilibili-bangumi/
     ├── README.md
     ├── manifest.json
-    └── resolve.js
+    ├── auth.js
+    ├── resolve.js
+    ├── src/
+    └── scripts/
 ```
 
 ### 插件目录约定
@@ -37,7 +40,7 @@ FluxDown-plugin/
 
 | 插件 | FluxDown identity | 版本 | 功能 |
 | --- | --- | --- | --- |
-| [bilibili-bangumi](./bilibili-bangumi/) | `fluxdown@bilibili-bangumi` | `0.1.3` | 发现 Bilibili 番剧分集、解析视频音频直链，并提供番剧订阅 |
+| [bilibili-bangumi](./bilibili-bangumi/) | `fluxdown@bilibili-bangumi` | `1.0.0` | 发现 Bilibili 番剧和 UP 主投稿、解析视频音频直链，并提供订阅 |
 
 ## 插件包格式
 

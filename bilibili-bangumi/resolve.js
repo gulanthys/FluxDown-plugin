@@ -39,6 +39,38 @@ function setting(name, fallback) {
   var value = flux.settings[name];
   return value == null ? fallback : value;
 }
+function pluginLog(level) {
+  try {
+    var logger = flux && flux.logger;
+    if (!logger || typeof logger[level] !== 'function') return;
+    var args = Array.prototype.slice.call(arguments, 1);
+    logger[level].apply(logger, args);
+  } catch (e) {}
+}
+
+function playQualityDiagnostics(play) {
+  var value = play || {};
+  var dash = value.dash && typeof value.dash === 'object' ? value.dash : {};
+  var videos = Array.isArray(dash.video) ? dash.video : [];
+  var formats = Array.isArray(value.support_formats) ? value.support_formats : [];
+  var quality = Array.isArray(value.accept_quality) ? value.accept_quality.map(function(item) { return Number(item) || item; }) : [];
+  var heights = videos.map(function(video) {
+    return { id: Number(video && (video.id || video.quality)) || 0, height: Number(video && (video.height || video.height_cm)) || 0, width: Number(video && video.width) || 0, codec: String(video && (video.codecs || video.codecs_name) || '') };
+  }).filter(function(item) { return item.id || item.height; });
+  heights.sort(function(a, b) { return b.height - a.height || b.id - a.id; });
+  return {
+    acceptQuality: quality,
+    supportFormats: formats.map(function(item) { return { quality: Number(item && (item.quality || item.quality_id)) || 0, format: String(item && (item.format || item.new_description || item.display_desc) || '') }; }),
+    dashVideo: heights.slice(0, 16),
+    dashMaxHeight: heights.reduce(function(max, item) { return Math.max(max, item.height); }, 0),
+    durlQuality: Number(value.quality) || 0
+  };
+}
+
+function logAuthDiagnostics(source, cookie, payload) {
+  var data = payload && payload.data ? payload.data : {};
+  pluginLog('info', '[bilibili] auth diagnostics', { source: source, hasSessdata: cookieContains(cookie, 'SESSDATA'), isLogin: data.isLogin === true, hasWbiImage: Boolean(data.wbi_img && data.wbi_img.img_url && data.wbi_img.sub_url) });
+}
 
 function sanitizeFileName(name) {
   return (name || 'video')
@@ -86,6 +118,25 @@ function normalizeSessdataCookie(cookie) {
   });
 }
 
+async function cookieFromAuthProfile() {
+  if (!flux.auth || typeof flux.auth.get !== 'function') return '';
+  var refs = [];
+  try {
+    var raw = await flux.storage.get('auth.refs');
+    var parsed = raw ? JSON.parse(raw) : [];
+    if (Array.isArray(parsed)) refs = parsed.slice();
+  } catch (e) {}
+  if (!refs.length) refs.push('fluxdown@bilibili-bangumi::api.bilibili.com');
+  for (var i = 0; i < refs.length; i++) {
+    if (!refs[i]) continue;
+    try {
+      var profile = await flux.auth.get(String(refs[i]));
+      var profileCookie = cookieHeader(profile && profile.cookies || '');
+      if (/(?:^|;\s*)SESSDATA=/i.test(profileCookie)) return profileCookie;
+    } catch (e) {}
+  }
+  return '';
+}
 async function effectiveCookie(ctx) {
   var raw = String((ctx && ctx.cookies) || '').trim();
   if (!raw) raw = String(setting('cookies', '') || '').trim();
@@ -105,6 +156,11 @@ async function effectiveCookie(ctx) {
       var stored = await flux.storage.get(AUTH_COOKIE_KEY);
       if (stored) return await appendStoredBfeId(String(stored));
     } catch (e) {}
+    var profileCookie = await cookieFromAuthProfile();
+    if (profileCookie) {
+      try { await flux.storage.set(AUTH_COOKIE_KEY, profileCookie); } catch (e) {}
+      return await appendStoredBfeId(profileCookie);
+    }
   }
   return '';
 }
@@ -218,9 +274,163 @@ async function apiGet(path, ctx, cookie) {
   }
   await rememberResponseBfeId(response);
   // PGC 接口返回 result，通用播放器接口返回 data。
-  return payload.result || payload.data || {};
+  var result = payload.result || payload.data || {};
+  if (/\/playurl(?:\?|$)/.test(path)) {
+    pluginLog('info', '[bilibili] playurl diagnostics', {
+      hasSessdata: cookieContains(requestCookie, 'SESSDATA'),
+      diagnostics: playQualityDiagnostics(result),
+    });
+  }
+  return result;
 }
 
+function md5(input) {
+  function safeAdd(x, y) {
+    var lsw = (x & 65535) + (y & 65535);
+    return (((x >>> 16) + (y >>> 16) + (lsw >>> 16)) << 16) | (lsw & 65535);
+  }
+  function bitRol(num, cnt) { return (num << cnt) | (num >>> (32 - cnt)); }
+  function cmn(q, a, b, x, s, t) { return safeAdd(bitRol(safeAdd(safeAdd(a, q), safeAdd(x, t)), s), b); }
+  function ff(a, b, c, d, x, s, t) { return cmn((b & c) | ((~b) & d), a, b, x, s, t); }
+  function gg(a, b, c, d, x, s, t) { return cmn((b & d) | (c & (~d)), a, b, x, s, t); }
+  function hh(a, b, c, d, x, s, t) { return cmn(b ^ c ^ d, a, b, x, s, t); }
+  function ii(a, b, c, d, x, s, t) { return cmn(c ^ (b | (~d)), a, b, x, s, t); }
+  function words(value) {
+    var bytes = unescape(encodeURIComponent(String(value)));
+    var n = bytes.length, count = ((n + 8) >>> 6) + 1, result = new Array(count * 16);
+    for (var i = 0; i < result.length; i++) result[i] = 0;
+    for (var j = 0; j < n; j++) result[j >> 2] |= bytes.charCodeAt(j) << ((j % 4) * 8);
+    result[n >> 2] |= 0x80 << ((n % 4) * 8);
+    result[count * 16 - 2] = n * 8;
+    return result;
+  }
+  function hex(value) {
+    var table = '0123456789abcdef', out = '';
+    for (var i = 0; i < 4; i++) out += table.charAt((value >>> (i * 8 + 4)) & 15) + table.charAt((value >>> (i * 8)) & 15);
+    return out;
+  }
+  var x = words(input), a = 0x67452301, b = 0xefcdab89, c = 0x98badcfe, d = 0x10325476;
+  for (var i = 0; i < x.length; i += 16) {
+    var oa = a, ob = b, oc = c, od = d;
+    a = ff(a,b,c,d,x[i+0],7,0xd76aa478); d = ff(d,a,b,c,x[i+1],12,0xe8c7b756); c = ff(c,d,a,b,x[i+2],17,0x242070db); b = ff(b,c,d,a,x[i+3],22,0xc1bdceee);
+    a = ff(a,b,c,d,x[i+4],7,0xf57c0faf); d = ff(d,a,b,c,x[i+5],12,0x4787c62a); c = ff(c,d,a,b,x[i+6],17,0xa8304613); b = ff(b,c,d,a,x[i+7],22,0xfd469501);
+    a = ff(a,b,c,d,x[i+8],7,0x698098d8); d = ff(d,a,b,c,x[i+9],12,0x8b44f7af); c = ff(c,d,a,b,x[i+10],17,0xffff5bb1); b = ff(b,c,d,a,x[i+11],22,0x895cd7be);
+    a = ff(a,b,c,d,x[i+12],7,0x6b901122); d = ff(d,a,b,c,x[i+13],12,0xfd987193); c = ff(c,d,a,b,x[i+14],17,0xa679438e); b = ff(b,c,d,a,x[i+15],22,0x49b40821);
+    a = gg(a,b,c,d,x[i+1],5,0xf61e2562); d = gg(d,a,b,c,x[i+6],9,0xc040b340); c = gg(c,d,a,b,x[i+11],14,0x265e5a51); b = gg(b,c,d,a,x[i+0],20,0xe9b6c7aa);
+    a = gg(a,b,c,d,x[i+5],5,0xd62f105d); d = gg(d,a,b,c,x[i+10],9,0x02441453); c = gg(c,d,a,b,x[i+15],14,0xd8a1e681); b = gg(b,c,d,a,x[i+4],20,0xe7d3fbc8);
+    a = gg(a,b,c,d,x[i+9],5,0x21e1cde6); d = gg(d,a,b,c,x[i+14],9,0xc33707d6); c = gg(c,d,a,b,x[i+3],14,0xf4d50d87); b = gg(b,c,d,a,x[i+8],20,0x455a14ed);
+    a = gg(a,b,c,d,x[i+13],5,0xa9e3e905); d = gg(d,a,b,c,x[i+2],9,0xfcefa3f8); c = gg(c,d,a,b,x[i+7],14,0x676f02d9); b = gg(b,c,d,a,x[i+12],20,0x8d2a4c8a);
+    a = hh(a,b,c,d,x[i+5],4,0xfffa3942); d = hh(d,a,b,c,x[i+8],11,0x8771f681); c = hh(c,d,a,b,x[i+11],16,0x6d9d6122); b = hh(b,c,d,a,x[i+14],23,0xfde5380c);
+    a = hh(a,b,c,d,x[i+1],4,0xa4beea44); d = hh(d,a,b,c,x[i+4],11,0x4bdecfa9); c = hh(c,d,a,b,x[i+7],16,0xf6bb4b60); b = hh(b,c,d,a,x[i+10],23,0xbebfbc70);
+    a = hh(a,b,c,d,x[i+13],4,0x289b7ec6); d = hh(d,a,b,c,x[i+0],11,0xeaa127fa); c = hh(c,d,a,b,x[i+3],16,0xd4ef3085); b = hh(b,c,d,a,x[i+6],23,0x04881d05);
+    a = hh(a,b,c,d,x[i+9],4,0xd9d4d039); d = hh(d,a,b,c,x[i+12],11,0xe6db99e5); c = hh(c,d,a,b,x[i+15],16,0x1fa27cf8); b = hh(b,c,d,a,x[i+2],23,0xc4ac5665);
+    a = ii(a,b,c,d,x[i+0],6,0xf4292244); d = ii(d,a,b,c,x[i+7],10,0x432aff97); c = ii(c,d,a,b,x[i+14],15,0xab9423a7); b = ii(b,c,d,a,x[i+5],21,0xfc93a039);
+    a = ii(a,b,c,d,x[i+12],6,0x655b59c3); d = ii(d,a,b,c,x[i+3],10,0x8f0ccc92); c = ii(c,d,a,b,x[i+10],15,0xffeff47d); b = ii(b,c,d,a,x[i+1],21,0x85845dd1);
+    a = ii(a,b,c,d,x[i+8],6,0x6fa87e4f); d = ii(d,a,b,c,x[i+15],10,0xfe2ce6e0); c = ii(c,d,a,b,x[i+6],15,0xa3014314); b = ii(b,c,d,a,x[i+13],21,0x4e0811a1);
+    a = ii(a,b,c,d,x[i+4],6,0xf7537e82); d = ii(d,a,b,c,x[i+11],10,0xbd3af235); c = ii(c,d,a,b,x[i+2],15,0x2ad7d2bb); b = ii(b,c,d,a,x[i+9],21,0xeb86d391);
+    a = safeAdd(a, oa); b = safeAdd(b, ob); c = safeAdd(c, oc); d = safeAdd(d, od);
+  }
+  return hex(a) + hex(b) + hex(c) + hex(d);
+}
+var WBI_CACHE_KEY = 'bilibili.wbi.keys';
+var WBI_MIXIN_KEY_ENC_TAB = [
+  46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35,
+  27, 43, 5, 49, 33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41,
+  13, 37, 48, 7, 16, 24, 55, 40, 61, 26, 17, 0, 1, 60, 51, 30,
+  4, 22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11
+];
+
+function wbiKeyPart(url) {
+  var value = String(url || '').split('?')[0];
+  var slash = value.lastIndexOf('/');
+  var name = slash >= 0 ? value.slice(slash + 1) : value;
+  var dot = name.lastIndexOf('.');
+  return dot > 0 ? name.slice(0, dot) : name;
+}
+
+function wbiMixinKey(imgKey, subKey) {
+  var raw = String(imgKey || '') + String(subKey || ''), out = '';
+  for (var i = 0; i < WBI_MIXIN_KEY_ENC_TAB.length; i++) {
+    if (raw[WBI_MIXIN_KEY_ENC_TAB[i]]) out += raw[WBI_MIXIN_KEY_ENC_TAB[i]];
+  }
+  return out.slice(0, 32);
+}
+
+async function apiGetPayload(path, ctx, cookie) {
+  var response;
+  try {
+    var requestCookie = cookie || await effectiveCookie(ctx);
+    response = await flux.fetch({
+      method: 'GET',
+      url: API_BASE + path,
+      headers: requestHeaders(requestCookie, ctx),
+    });
+  } catch (e) {
+    throw new Error('Bilibili 接口请求失败: ' + String(e));
+  }
+  if (!response || response.status < 200 || response.status >= 300) {
+    throw new Error('Bilibili 接口 HTTP 状态异常: ' + String(response && response.status));
+  }
+  var payload;
+  try { payload = JSON.parse(response.body || ''); } catch (e) {
+    throw new Error('Bilibili 接口返回非法 JSON: ' + String(e));
+  }
+  await rememberResponseBfeId(response);
+  if (/\/x\/web-interface\/nav(?:\?|$)/.test(path)) logAuthDiagnostics('nav', requestCookie, payload);
+  return payload;
+}
+
+async function getWbiKeys(ctx, cookie, forceRefresh) {
+  if (!forceRefresh) {
+    try {
+      var cached = JSON.parse(String(await flux.storage.get(WBI_CACHE_KEY) || 'null'));
+      if (cached && cached.mixinKey && Number(cached.expiresAt) > Date.now()) return cached.mixinKey;
+    } catch (e) {}
+  }
+  var payload = await apiGetPayload('/x/web-interface/nav', ctx, cookie);
+  var image = payload && payload.data && payload.data.wbi_img;
+  var mixinKey = wbiMixinKey(wbiKeyPart(image && image.img_url), wbiKeyPart(image && image.sub_url));
+  if (!mixinKey) throw new Error('Bilibili WBI key 获取失败');
+  try {
+    await flux.storage.set(WBI_CACHE_KEY, JSON.stringify({ mixinKey: mixinKey, expiresAt: Date.now() + 12 * 60 * 60 * 1000 }));
+  } catch (e) {}
+  return mixinKey;
+}
+
+function wbiEncode(value) {
+  return encodeURIComponent(String(value == null ? '' : value)).replace(/[!'()*]/g, '');
+}
+
+async function signedWbiPath(path, params, ctx, cookie, forceRefresh) {
+  var mixinKey = await getWbiKeys(ctx, cookie, forceRefresh);
+  var all = {};
+  var keys = Object.keys(params || {});
+  for (var i = 0; i < keys.length; i++) all[keys[i]] = params[keys[i]];
+  all.wts = Math.floor(Date.now() / 1000);
+  keys = Object.keys(all).sort();
+  var query = [];
+  for (var j = 0; j < keys.length; j++) query.push(wbiEncode(keys[j]) + '=' + wbiEncode(all[keys[j]]));
+  var queryString = query.join('&');
+  return path + '?' + queryString + '&w_rid=' + md5(queryString + mixinKey);
+}
+
+async function apiGetWbi(path, params, ctx, cookie) {
+  var lastError = null;
+  for (var attempt = 0; attempt < 2; attempt++) {
+    try {
+      return await apiGet(await signedWbiPath(path, params, ctx, cookie, attempt > 0), ctx, cookie);
+    } catch (e) {
+      lastError = e;
+      if (attempt === 0 && /code=(-352|-799)/.test(String(e))) {
+        try { await flux.storage.set(WBI_CACHE_KEY, ''); } catch (ignored) {}
+        await delay(800);
+        continue;
+      }
+      break;
+    }
+  }
+  throw lastError || new Error('Bilibili WBI 接口请求失败');
+}
 function firstMatch(url, pattern) {
   var match = pattern.exec(url || '');
   return match && match[1] ? match[1] : '';
@@ -896,7 +1106,6 @@ function chooseDashIndex(variants, quality) {
   return best;
 }
 
-
 // 订阅轮询会直接为条目建任务，单次只解析最近一批分集，避免长篇番剧或大量番外
 // 让一次订阅调用超过宿主的墙钟预算。核心会保留已知 guid，后续轮询继续尝试最新分集。
 var MAX_SUBSCRIPTION_EPISODES = 50;
@@ -931,7 +1140,7 @@ function subscriptionEpisodeGroups(result, includeExtras) {
 
 function subscriptionQualityCandidates(play, title) {
   var candidates = [];
-  var variants = selectListedQualityVariants(buildManifestVariantsFromPlay(play, title), Boolean(setting('highestQualityOnly', false)));
+  var variants = selectListedQualityVariants(buildManifestVariantsFromPlay(play, title), arguments.length > 2 ? Boolean(arguments[2]) : Boolean(setting('highestQualityOnly', false)));
   for (var i = 0; i < variants.length; i++) {
     var variant = variants[i] || {};
     var qualityId = Number(variant.qualityId) || 0;
@@ -945,7 +1154,145 @@ function subscriptionQualityCandidates(play, title) {
     });
   }
   return candidates;
-}async function subscribeBangumi(ctx) {
+}
+function uploaderMidFromUrl(url) {
+  var value = String(url || '').trim();
+  var match = /space\.bilibili\.com\/(\d+)/i.exec(value);
+  if (match && match[1]) return match[1];
+  match = /[?&]mid=(\d+)/i.exec(value);
+  if (match && match[1]) return match[1];
+  if (/^\d+$/.test(value)) return value;
+  return '';
+}
+function isUploaderUrl(url) { return Boolean(uploaderMidFromUrl(url)); }
+function uploaderInfoPath() { return '/x/space/wbi/acc/info'; }
+function uploaderVideosPath() { return '/x/space/wbi/arc/search'; }
+function uploaderVideoUrl(bvid) { return 'https://www.bilibili.com/video/' + encodeURIComponent(bvid); }
+function videoPlayUrl(video, qualityId) {
+  var qn = Number(qualityId) || 127;
+  return '/x/player/playurl?bvid=' + encodeURIComponent(video.bvid) + '&cid=' + encodeURIComponent(video.cid) +
+    '&qn=' + encodeURIComponent(qn) + '&fnval=4048&fourk=1&fnver=0&otype=json&platform=pc';
+}
+function uploaderVideoTitle(uploaderName, videoTitle, variant) {
+  var label = String(variant && variant.label || '').trim() || 'unknown-quality';
+  var sourceName = String(variant && variant.fileName || '');
+  var extensionMatch = /\.([a-z0-9]{1,8})$/i.exec(sourceName);
+  var extension = extensionMatch ? extensionMatch[1].toLowerCase() : 'mp4';
+  return sanitizeFileName(uploaderName + ' - ' + videoTitle + ' [' + label + '].' + extension);
+}
+async function listUploaderVideos(mid, ctx, cookie, limit) {
+  var pageSize = Math.min(30, Math.max(1, Number(limit) || 20));
+  var listing = await apiGetWbi(uploaderVideosPath(), { mid: mid, ps: pageSize, pn: 1, order: 'pubdate', platform: 'web', web_location: '1550101' }, ctx, cookie);
+  var data = listing && listing.list ? listing.list : listing;
+  var videos = data && Array.isArray(data.vlist) ? data.vlist : [];
+  var normalized = [], seen = {};
+  for (var i = 0; i < videos.length && normalized.length < pageSize; i++) {
+    var item = videos[i] || {};
+    var bvid = String(item.bvid || item.BV || '');
+    if (!bvid || seen[bvid]) continue;
+    seen[bvid] = true;
+    normalized.push({
+      bvid: bvid,
+      aid: Number(item.aid) || 0,
+      title: sanitizeFileName(String(item.title || bvid).replace(/<[^>]+>/g, '')),
+      description: String(item.description || ''),
+      cover: String(item.pic || ''),
+      pubdate: episodePubDate({ pub_time: item.created }),
+      duration: String(item.length || ''),
+    });
+  }
+  var nextIndex = 0;
+  async function worker() {
+    while (true) {
+      var index = nextIndex++;
+      if (index >= normalized.length) return;
+      var current = normalized[index];
+      try {
+        var view = await apiGet('/x/web-interface/view?bvid=' + encodeURIComponent(current.bvid), ctx, cookie);
+        var pages = view && Array.isArray(view.pages) ? view.pages : [];
+        current.cid = Number((pages[0] || {}).cid) || 0;
+        current.pageCount = pages.length;
+      } catch (e) { current.cid = 0; }
+    }
+  }
+  var workers = Math.min(4, normalized.length), jobs = [];
+  for (var wi = 0; wi < workers; wi++) jobs.push(worker());
+  await Promise.all(jobs);
+  return normalized.filter(function(video) { return video.cid > 0; });
+}
+async function subscribeUploader(ctx) {
+  var mid = uploaderMidFromUrl(ctx.url);
+  if (!mid) throw new Error('无法从 Bilibili UP 主链接识别 mid');
+  var cookie = await effectiveCookie(ctx);
+  var infoResult = await apiGetWbi(uploaderInfoPath(), { mid: mid }, ctx, cookie);
+  var info = infoResult && infoResult.card ? infoResult.card : infoResult;
+  var uploaderName = sanitizeFileName(String((info && (info.name || info.uname)) || ('UP主 ' + mid)));
+  var limit = 20;
+  var videos = await listUploaderVideos(mid, ctx, cookie, limit);
+  if (!videos.length) throw new Error('Bilibili 未返回可订阅的普通投稿视频');
+  var items = [];
+  for (var i = 0; i < videos.length; i++) {
+    var video = videos[i];
+    try {
+      var play = await apiGet(videoPlayUrl(video), ctx, cookie);
+      var variants = subscriptionQualityCandidates(play, video.title, true);
+      for (var vi = 0; vi < variants.length; vi++) {
+        var variant = variants[vi], qualityKey = String(variant.qualityId);
+        items.push({
+          guid: 'video:' + video.bvid + ':cid:' + String(video.cid) + '@q:' + qualityKey,
+          title: uploaderVideoTitle(uploaderName, video.title, variant),
+          link: uploaderVideoUrl(video.bvid),
+          enclosureUrl: '',
+          enclosureLength: Number(variant.totalBytes) > 0 ? Number(variant.totalBytes) : 0,
+          pubDate: video.pubdate,
+          resolverItem: 'video:' + video.bvid + ':cid:' + String(video.cid) + '@q:' + qualityKey,
+        });
+      }
+    } catch (e) {}
+  }
+  if (!items.length) throw new Error('Bilibili 投稿均未返回可下载画质');
+  return { title: 'Bilibili UP主 - ' + uploaderName, link: ctx.url, items: items };
+}
+async function resolveUploaderVideo(ctx) {
+  var match = /^video:([^:]+):cid:(\d+)(?:@q:(\d+|h\d+))?$/.exec(String(ctx.resolverItem || ''));
+  if (!match) throw new Error('Bilibili 投稿视频标识非法: ' + String(ctx.resolverItem || ''));
+  var video = { bvid: match[1], cid: Number(match[2]) }, qualityKey = match[3] || '';
+  var cookie = await effectiveCookie(ctx), play = null;
+  var requestedQualityId = /^\d+$/.test(qualityKey) ? Number(qualityKey) : 0;
+  if (requestedQualityId) {
+    try { play = await apiGet(videoPlayUrl(video, requestedQualityId), ctx, cookie); } catch (e) {}
+  }
+  if (!play) play = await apiGet(videoPlayUrl(video), ctx, cookie);
+  var resolvedTitle = '';
+  try {
+    var view = await apiGet('/x/web-interface/view?bvid=' + encodeURIComponent(video.bvid), ctx, cookie);
+    resolvedTitle = String(view && view.title || '');
+  } catch (e) {}
+  var title = sanitizeFileName(String(ctx.title || resolvedTitle || video.bvid));
+  var headers = requestHeaders(cookie, ctx), dash = play.dash || {};
+  var audios = Array.isArray(dash.audio) ? dash.audio : [], audio = pickAudioTrack(audios);
+  var variants = buildVariantsFromPlay(play, title);
+  var chosenIndex = qualityKey ? chooseVariantIndex(variants, qualityKey) : chooseDashIndex(variants, String(setting('quality', 'best')));
+  if (qualityKey) {
+    if (chosenIndex < 0 || !variants[chosenIndex]) throw new Error('Bilibili 未返回所选画质: ' + qualityKey);
+    var fixed = variants[chosenIndex], fixedResult = { url: fixed.url, fileName: fixed.fileName, totalBytes: fixed.totalBytes, extraHeaders: headers, ephemeral: true, rangeSupported: true };
+    if (fixed.audioUrl) fixedResult.audioUrl = fixed.audioUrl;
+    return fixedResult;
+  }
+  if (String(setting('quality', 'best')) === 'audio') {
+    if (!audio) throw new Error('Bilibili 当前没有独立音频轨');
+    return { url: audioUrl(audio), fileName: title + ' [audio].m4a', totalBytes: streamSize(audio), extraHeaders: headers, ephemeral: true, rangeSupported: true };
+  }
+  if (variants.length) {
+    var chosen = variants[chosenIndex] || variants[0];
+    var result = { url: chosen.url, fileName: chosen.fileName, totalBytes: chosen.totalBytes, extraHeaders: headers, ephemeral: true, rangeSupported: true, variants: variants, defaultVariantIndex: chosenIndex };
+    if (chosen.audioUrl) result.audioUrl = chosen.audioUrl;
+    return result;
+  }
+  throw new Error('Bilibili 投稿播放接口未返回 DASH 地址');
+}
+
+async function subscribeBangumi(ctx) {
   var cookie = await effectiveCookie(ctx);
   var seasonId = await seasonIdFromUrl(ctx.url, ctx, cookie);
   if (!seasonId) throw new Error('无法从 Bilibili 番剧链接识别 season_id 或 media_id');
@@ -1035,8 +1382,11 @@ function subscriptionQualityCandidates(play, title) {
 }
 
 globalThis.resolve = async (ctx) => {
+  if (String(ctx.resolverItem || '').indexOf('video:') === 0) return await resolveUploaderVideo(ctx);
   if (ctx.resolverItem) return await resolveEpisode(ctx);
   return await resolveManifest(ctx);
 };
 
-globalThis.subscribe = async (ctx) => await subscribeBangumi(ctx);
+globalThis.subscribe = async (ctx) => isUploaderUrl(ctx.url)
+  ? await subscribeUploader(ctx)
+  : await subscribeBangumi(ctx);

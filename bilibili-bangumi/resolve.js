@@ -431,6 +431,53 @@ async function apiGetWbi(path, params, ctx, cookie) {
   }
   throw lastError || new Error('Bilibili WBI 接口请求失败');
 }
+function htmlAttribute(tag, name) {
+  var match = new RegExp('\\s' + name + '\\s*=\\s*(?:"([^"]*)"|\'([^\']*)\')', 'i').exec(tag);
+  return match ? String(match[1] == null ? match[2] : match[1]).replace(/&amp;/gi, '&') : '';
+}
+
+async function expandBilibiliShortUrl(ctx) {
+  var url = String(ctx.url || '').trim();
+  if (!/^https?:\/\/(?:b23\.tv|bili2233\.cn)\/[a-z0-9]+\/?(?:[?#]|$)/i.test(url)) return ctx;
+  // 宿主自动跟随重定向但不暴露最终 URL；从落地页读取规范链接。
+  // 不转发任务 Cookie、自定义头或认证引用到短链服务。
+  var response = await flux.fetch({
+    method: 'GET',
+    url: url,
+    headers: { 'User-Agent': USER_AGENT, Referer: 'https://www.bilibili.com/' },
+  });
+  if (!response || response.status < 200 || response.status >= 300) {
+    throw new Error('Bilibili 短链展开失败，HTTP 状态: ' + String(response && response.status));
+  }
+  if (response.truncated) throw new Error('Bilibili 短链页面被截断，无法可靠识别目标');
+  var html = String(response.body || '');
+  var tags = html.match(/<(?:link|meta)\b[^>]*>/gi) || [];
+  var target = '';
+  for (var i = 0; i < tags.length; i++) {
+    if (htmlAttribute(tags[i], 'rel').toLowerCase() === 'canonical') {
+      target = htmlAttribute(tags[i], 'href');
+      break;
+    }
+    if (htmlAttribute(tags[i], 'property').toLowerCase() === 'og:url') target = htmlAttribute(tags[i], 'content');
+  }
+  if (!/^https?:\/\/(?:(?:www|m)\.)?bilibili\.com\/(?:video\/(?:BV[0-9a-z]+|av\d+)\/?(?:[?#]|$)|bangumi\/(?:play|media)(?:\/|\?))/i.test(target) &&
+      !/^https?:\/\/space\.bilibili\.com\/\d+\/?(?:[?#]|$)/i.test(target)) {
+    throw new Error('Bilibili 短链未返回支持的页面，可能触发验证码或链接目标不受支持');
+  }
+  if (/\/video\//i.test(target) && /__INITIAL_STATE__\s*=/.test(html)) {
+    var stateMatch = /__INITIAL_STATE__\s*=\s*(\{[\s\S]*?\})\s*;\s*(?:\(function|<\/script>)/.exec(html);
+    if (!stateMatch) throw new Error('Bilibili 短链页面状态无法识别，无法保留分 P');
+    var state = JSON.parse(stateMatch[1]);
+    if (state.p != null) {
+      var page = Number(state.p);
+      if (!Number.isInteger(page) || page < 1) throw new Error('Bilibili 短链页面分 P 非法');
+      target = target.split('#')[0].replace(/([?&])p=[^&]*/i, '$1p=' + page);
+      if (!/[?&]p=/.test(target)) target += (target.indexOf('?') < 0 ? '?' : '&') + 'p=' + page;
+    }
+  }
+  return Object.assign({}, ctx, { url: target });
+}
+
 function firstMatch(url, pattern) {
   var match = pattern.exec(url || '');
   return match && match[1] ? match[1] : '';
@@ -1253,6 +1300,28 @@ async function subscribeUploader(ctx) {
   if (!items.length) throw new Error('Bilibili 投稿均未返回可下载画质');
   return { title: 'Bilibili UP主 - ' + uploaderName, link: ctx.url, items: items };
 }
+async function resolveVideoPage(ctx) {
+  var url = String(ctx.url || '').trim();
+  var match = /^https?:\/\/(?:(?:www|m)\.)?bilibili\.com\/video\/(BV[0-9a-z]+|av\d+)\/?(?:[?#]|$)/i.exec(url);
+  if (!match) throw new Error('无法从 Bilibili 视频链接识别 BV 或 AV 号');
+  var id = match[1];
+  var lookup = /^av/i.test(id) ? 'aid=' + id.slice(2) : 'bvid=' + encodeURIComponent(id);
+  var cookie = await effectiveCookie(ctx);
+  var view = await apiGet('/x/web-interface/view?' + lookup, ctx, cookie);
+  var pageMatch = /[?&]p=([^&#]*)/i.exec(url.split('#')[0]);
+  var pageNumber = pageMatch ? Number(pageMatch[1]) : 1;
+  if (!Number.isInteger(pageNumber) || pageNumber < 1) throw new Error('Bilibili 视频分 P 参数非法');
+  var pages = Array.isArray(view.pages) ? view.pages : [];
+  var page = pages[pageNumber - 1];
+  if (!page || !Number(page.cid) || !view.bvid) throw new Error('Bilibili 未返回指定分 P 的视频信息');
+  var title = String(view.title || view.bvid);
+  if (pages.length > 1) title += ' - P' + pageNumber + ' ' + String(page.part || '');
+  return await resolveUploaderVideo(Object.assign({}, ctx, {
+    title: title,
+    resolverItem: 'video:' + view.bvid + ':cid:' + String(page.cid),
+  }));
+}
+
 async function resolveUploaderVideo(ctx) {
   var match = /^video:([^:]+):cid:(\d+)(?:@q:(\d+|h\d+))?$/.exec(String(ctx.resolverItem || ''));
   if (!match) throw new Error('Bilibili 投稿视频标识非法: ' + String(ctx.resolverItem || ''));
@@ -1264,10 +1333,12 @@ async function resolveUploaderVideo(ctx) {
   }
   if (!play) play = await apiGet(videoPlayUrl(video), ctx, cookie);
   var resolvedTitle = '';
-  try {
-    var view = await apiGet('/x/web-interface/view?bvid=' + encodeURIComponent(video.bvid), ctx, cookie);
-    resolvedTitle = String(view && view.title || '');
-  } catch (e) {}
+  if (!ctx.title) {
+    try {
+      var view = await apiGet('/x/web-interface/view?bvid=' + encodeURIComponent(video.bvid), ctx, cookie);
+      resolvedTitle = String(view && view.title || '');
+    } catch (e) {}
+  }
   var title = sanitizeFileName(String(ctx.title || resolvedTitle || video.bvid));
   var headers = requestHeaders(cookie, ctx), dash = play.dash || {};
   var audios = Array.isArray(dash.audio) ? dash.audio : [], audio = pickAudioTrack(audios);
@@ -1384,9 +1455,12 @@ async function subscribeBangumi(ctx) {
 globalThis.resolve = async (ctx) => {
   if (String(ctx.resolverItem || '').indexOf('video:') === 0) return await resolveUploaderVideo(ctx);
   if (ctx.resolverItem) return await resolveEpisode(ctx);
+  ctx = await expandBilibiliShortUrl(ctx);
+  if (/^https?:\/\/(?:(?:www|m)\.)?bilibili\.com\/video\//i.test(String(ctx.url || '').trim())) return await resolveVideoPage(ctx);
   return await resolveManifest(ctx);
 };
 
-globalThis.subscribe = async (ctx) => isUploaderUrl(ctx.url)
-  ? await subscribeUploader(ctx)
-  : await subscribeBangumi(ctx);
+globalThis.subscribe = async (ctx) => {
+  ctx = await expandBilibiliShortUrl(ctx);
+  return isUploaderUrl(ctx.url) ? await subscribeUploader(ctx) : await subscribeBangumi(ctx);
+};

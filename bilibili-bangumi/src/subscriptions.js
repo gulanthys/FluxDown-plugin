@@ -145,6 +145,28 @@ async function subscribeUploader(ctx) {
   if (!items.length) throw new Error('Bilibili 投稿均未返回可下载画质');
   return { title: 'Bilibili UP主 - ' + uploaderName, link: ctx.url, items: items };
 }
+async function resolveVideoPage(ctx) {
+  var url = String(ctx.url || '').trim();
+  var match = /^https?:\/\/(?:(?:www|m)\.)?bilibili\.com\/video\/(BV[0-9a-z]+|av\d+)\/?(?:[?#]|$)/i.exec(url);
+  if (!match) throw new Error('无法从 Bilibili 视频链接识别 BV 或 AV 号');
+  var id = match[1];
+  var lookup = /^av/i.test(id) ? 'aid=' + id.slice(2) : 'bvid=' + encodeURIComponent(id);
+  var cookie = await effectiveCookie(ctx);
+  var view = await apiGet('/x/web-interface/view?' + lookup, ctx, cookie);
+  var pageMatch = /[?&]p=([^&#]*)/i.exec(url.split('#')[0]);
+  var pageNumber = pageMatch ? Number(pageMatch[1]) : 1;
+  if (!Number.isInteger(pageNumber) || pageNumber < 1) throw new Error('Bilibili 视频分 P 参数非法');
+  var pages = Array.isArray(view.pages) ? view.pages : [];
+  var page = pages[pageNumber - 1];
+  if (!page || !Number(page.cid) || !view.bvid) throw new Error('Bilibili 未返回指定分 P 的视频信息');
+  var title = String(view.title || view.bvid);
+  if (pages.length > 1) title += ' - P' + pageNumber + ' ' + String(page.part || '');
+  return await resolveUploaderVideo(Object.assign({}, ctx, {
+    title: title,
+    resolverItem: 'video:' + view.bvid + ':cid:' + String(page.cid),
+  }));
+}
+
 async function resolveUploaderVideo(ctx) {
   var match = /^video:([^:]+):cid:(\d+)(?:@q:(\d+|h\d+))?$/.exec(String(ctx.resolverItem || ''));
   if (!match) throw new Error('Bilibili 投稿视频标识非法: ' + String(ctx.resolverItem || ''));
@@ -156,10 +178,12 @@ async function resolveUploaderVideo(ctx) {
   }
   if (!play) play = await apiGet(videoPlayUrl(video), ctx, cookie);
   var resolvedTitle = '';
-  try {
-    var view = await apiGet('/x/web-interface/view?bvid=' + encodeURIComponent(video.bvid), ctx, cookie);
-    resolvedTitle = String(view && view.title || '');
-  } catch (e) {}
+  if (!ctx.title) {
+    try {
+      var view = await apiGet('/x/web-interface/view?bvid=' + encodeURIComponent(video.bvid), ctx, cookie);
+      resolvedTitle = String(view && view.title || '');
+    } catch (e) {}
+  }
   var title = sanitizeFileName(String(ctx.title || resolvedTitle || video.bvid));
   var headers = requestHeaders(cookie, ctx), dash = play.dash || {};
   var audios = Array.isArray(dash.audio) ? dash.audio : [], audio = pickAudioTrack(audios);

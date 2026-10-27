@@ -431,6 +431,53 @@ async function apiGetWbi(path, params, ctx, cookie) {
   }
   throw lastError || new Error('Bilibili WBI 接口请求失败');
 }
+function htmlAttribute(tag, name) {
+  var match = new RegExp('\\s' + name + '\\s*=\\s*(?:"([^"]*)"|\'([^\']*)\')', 'i').exec(tag);
+  return match ? String(match[1] == null ? match[2] : match[1]).replace(/&amp;/gi, '&') : '';
+}
+
+async function expandBilibiliShortUrl(ctx) {
+  var url = String(ctx.url || '').trim();
+  if (!/^https?:\/\/(?:b23\.tv|bili2233\.cn)\/[a-z0-9]+\/?(?:[?#]|$)/i.test(url)) return ctx;
+  // 宿主自动跟随重定向但不暴露最终 URL；从落地页读取规范链接。
+  // 不转发任务 Cookie、自定义头或认证引用到短链服务。
+  var response = await flux.fetch({
+    method: 'GET',
+    url: url,
+    headers: { 'User-Agent': USER_AGENT, Referer: 'https://www.bilibili.com/' },
+  });
+  if (!response || response.status < 200 || response.status >= 300) {
+    throw new Error('Bilibili 短链展开失败，HTTP 状态: ' + String(response && response.status));
+  }
+  if (response.truncated) throw new Error('Bilibili 短链页面被截断，无法可靠识别目标');
+  var html = String(response.body || '');
+  var tags = html.match(/<(?:link|meta)\b[^>]*>/gi) || [];
+  var target = '';
+  for (var i = 0; i < tags.length; i++) {
+    if (htmlAttribute(tags[i], 'rel').toLowerCase() === 'canonical') {
+      target = htmlAttribute(tags[i], 'href');
+      break;
+    }
+    if (htmlAttribute(tags[i], 'property').toLowerCase() === 'og:url') target = htmlAttribute(tags[i], 'content');
+  }
+  if (!/^https?:\/\/(?:(?:www|m)\.)?bilibili\.com\/(?:video\/(?:BV[0-9a-z]+|av\d+)\/?(?:[?#]|$)|bangumi\/(?:play|media)(?:\/|\?))/i.test(target) &&
+      !/^https?:\/\/space\.bilibili\.com\/\d+\/?(?:[?#]|$)/i.test(target)) {
+    throw new Error('Bilibili 短链未返回支持的页面，可能触发验证码或链接目标不受支持');
+  }
+  if (/\/video\//i.test(target) && /__INITIAL_STATE__\s*=/.test(html)) {
+    var stateMatch = /__INITIAL_STATE__\s*=\s*(\{[\s\S]*?\})\s*;\s*(?:\(function|<\/script>)/.exec(html);
+    if (!stateMatch) throw new Error('Bilibili 短链页面状态无法识别，无法保留分 P');
+    var state = JSON.parse(stateMatch[1]);
+    if (state.p != null) {
+      var page = Number(state.p);
+      if (!Number.isInteger(page) || page < 1) throw new Error('Bilibili 短链页面分 P 非法');
+      target = target.split('#')[0].replace(/([?&])p=[^&]*/i, '$1p=' + page);
+      if (!/[?&]p=/.test(target)) target += (target.indexOf('?') < 0 ? '?' : '&') + 'p=' + page;
+    }
+  }
+  return Object.assign({}, ctx, { url: target });
+}
+
 function firstMatch(url, pattern) {
   var match = pattern.exec(url || '');
   return match && match[1] ? match[1] : '';

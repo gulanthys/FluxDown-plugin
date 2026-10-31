@@ -5,16 +5,16 @@
 //   2. manifest 条目启动时 → 用 resolverItem(ep:<id>) 调 B 站播放接口取得 DASH
 //      视频/音频短期直链，再交回 FluxDown 下载引擎。
 //
-// 订阅轮询不放在插件内：当前插件契约没有后台 timer 或主动 createTask API。
-// 因此本插件保持独立、无 Rust 修改，先负责稳定的「分集发现 + 单集解析」。
+// 追番与 UP 主更新由 FluxDown 的 subscribe 契约调度；插件只负责返回有限批次，
+// 不创建后台定时器或直接建下载任务。
 
 var API_BASE = 'https://api.bilibili.com';
 var USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
   '(KHTML, like Gecko) Chrome/131.0 Safari/537.36';
 var MAX_EPISODES = 1000;
 var MAX_VARIANTS = 16;
-var AUTH_COOKIE_KEY = 'auth.cookie';
 var BFE_ID_KEY = 'auth.bfe_id';
+var MAX_MANIFEST_PATH_CHARS = 180;
 // bili32 使用通用播放器接口时携带的 session 参数；番剧分集也能通过
 // bvid + cid 走同一接口，并返回完整的 DASH 画质列表。
 var PLAYER_SESSION = '68191c1dc3c75042c6f35fba895d65b0';
@@ -72,23 +72,59 @@ function logAuthDiagnostics(source, cookie, payload) {
   pluginLog('info', '[bilibili] auth diagnostics', { source: source, hasSessdata: cookieContains(cookie, 'SESSDATA'), isLogin: data.isLogin === true, hasWbiImage: Boolean(data.wbi_img && data.wbi_img.img_url && data.wbi_img.sub_url) });
 }
 
+function truncateCodePoints(value, maxLength) {
+  return Array.from(String(value || '')).slice(0, Math.max(0, maxLength)).join('');
+}
+
 function sanitizeFileName(name) {
-  return (name || 'video')
+  return truncateCodePoints((name || 'video')
     .replace(/[\\/:*?"<>|\u0000-\u001f]/g, ' ')
     .replace(/\.{2,}/g, '.')
     .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, 120) || 'video';
+    .trim(), 120) || 'video';
 }
 
 function sanitizePath(name) {
   var value = sanitizeFileName(name).replace(/[.]/g, ' ');
-  return value.slice(0, 80).trim();
+  return truncateCodePoints(value, 80).trim();
 }
+
+
+function fitManifestItems(items) {
+  var usedNames = Object.create(null);
+  return items.map(function(item) {
+    var path = String(item.path || '');
+    var pathLength = Array.from(path).length;
+    var nameBudget = MAX_MANIFEST_PATH_CHARS - pathLength - (path ? 1 : 0);
+    if (nameBudget < 1) throw new Error('番剧目录名超过 FluxDown 清单路径长度上限');
+    var rawName = String(item.name || 'video');
+    var dot = rawName.lastIndexOf('.');
+    var extension = dot > 0 ? rawName.slice(dot) : '';
+    if (Array.from(extension).length >= nameBudget) throw new Error('番剧文件扩展名超过 FluxDown 清单路径长度上限');
+    var stem = extension ? rawName.slice(0, dot) : rawName;
+    var pathKey = path.toLowerCase();
+    if (!usedNames[pathKey]) usedNames[pathKey] = Object.create(null);
+    var names = usedNames[pathKey];
+    var candidate = '';
+    for (var duplicate = 1; duplicate <= 10000; duplicate++) {
+      var suffix = duplicate === 1 ? '' : ' (' + duplicate + ')';
+      var stemBudget = nameBudget - Array.from(extension + suffix).length;
+      if (stemBudget < 1) throw new Error('同目录中的番剧文件名无法唯一化');
+      candidate = truncateCodePoints(stem, stemBudget) + suffix + extension;
+      if (!names[candidate.toLowerCase()]) break;
+      candidate = '';
+    }
+    if (!candidate) throw new Error('同目录中的番剧文件名数量超过上限');
+    names[candidate.toLowerCase()] = true;
+    return Object.assign({}, item, { name: candidate });
+  });
+}
+
 
 function cookieHeaderFromNetscape(raw) {
   var lines = String(raw || '').split(/\r?\n/);
   var pairs = [];
+  var now = Math.floor(Date.now() / 1000);
   for (var i = 0; i < lines.length; i++) {
     var line = lines[i].trim();
     if (!line) continue;
@@ -96,9 +132,18 @@ function cookieHeaderFromNetscape(raw) {
     if (line.indexOf('#HttpOnly_') === 0) line = line.slice('#HttpOnly_'.length);
     else if (line[0] === '#') continue;
     var fields = line.split('\t');
-    if (fields.length >= 7 && fields[5]) {
-      pairs.push(fields[5] + '=' + fields.slice(6).join('\t'));
-    }
+    if (fields.length < 7 || !fields[5]) continue;
+    var rawDomain = String(fields[0] || '').toLowerCase();
+    var domain = rawDomain.replace(/^\./, '');
+    var apiHost = 'api.bilibili.com';
+    var includeSubdomains = String(fields[1]).toUpperCase() === 'TRUE';
+    var belongsToBilibili = domain === 'bilibili.com' || domain.endsWith('.bilibili.com');
+    var domainMatches = belongsToBilibili && (domain === apiHost || (includeSubdomains && apiHost.endsWith('.' + domain)));
+    var cookiePath = String(fields[2] || '/');
+    var secure = String(fields[3]).toUpperCase() === 'TRUE';
+    var expires = Number(fields[4]) || 0;
+    if (!domainMatches || cookiePath !== '/' || (secure && !API_BASE.startsWith('https://')) || (expires > 0 && expires <= now)) continue;
+    pairs.push(fields[5] + '=' + fields.slice(6).join('\t'));
   }
   return pairs.join('; ');
 }
@@ -120,49 +165,35 @@ function normalizeSessdataCookie(cookie) {
 
 async function cookieFromAuthProfile() {
   if (!flux.auth || typeof flux.auth.get !== 'function') return '';
-  var refs = [];
+  var apiAuthRef = 'fluxdown@bilibili-bangumi::https://api.bilibili.com';
   try {
     var raw = await flux.storage.get('auth.refs');
     var parsed = raw ? JSON.parse(raw) : [];
-    if (Array.isArray(parsed)) refs = parsed.slice();
+    if (Array.isArray(parsed)) {
+      var hasApiRef = parsed.some(function(ref) {
+        return String(ref || '').replace('::api.bilibili.com', '::https://api.bilibili.com') === apiAuthRef;
+      });
+      if (parsed.length && !hasApiRef) return '';
+    }
   } catch (e) {}
-  if (!refs.length) refs.push('fluxdown@bilibili-bangumi::api.bilibili.com');
-  for (var i = 0; i < refs.length; i++) {
-    if (!refs[i]) continue;
-    try {
-      var profile = await flux.auth.get(String(refs[i]));
-      var profileCookie = cookieHeader(profile && profile.cookies || '');
+  try {
+    var profile = await flux.auth.get(apiAuthRef);
+    var expiresAt = Number(profile && profile.expiresAt) || 0;
+    if (profile && (!expiresAt || expiresAt > Math.floor(Date.now() / 1000))) {
+      var profileCookie = cookieHeader(profile.cookies || '');
       if (/(?:^|;\s*)SESSDATA=/i.test(profileCookie)) return profileCookie;
-    } catch (e) {}
-  }
+    }
+  } catch (e) {}
   return '';
 }
+
 async function effectiveCookie(ctx) {
   var raw = String((ctx && ctx.cookies) || '').trim();
   if (!raw) raw = String(setting('cookies', '') || '').trim();
   var cookie = normalizeSessdataCookie(cookieHeader(raw));
-
-  // 显式输入优先于缓存。首次解析时保存规范化后的 Cookie，后续任务可以复用。
-  if (cookie) {
-    try {
-      var previous = await flux.storage.get(AUTH_COOKIE_KEY);
-      if (previous !== cookie) await flux.storage.set(AUTH_COOKIE_KEY, cookie);
-    } catch (e) {}
-    return await appendStoredBfeId(cookie);
-  }
-
-  if (setting('reuseStoredSession', true)) {
-    try {
-      var stored = await flux.storage.get(AUTH_COOKIE_KEY);
-      if (stored) return await appendStoredBfeId(String(stored));
-    } catch (e) {}
-    var profileCookie = await cookieFromAuthProfile();
-    if (profileCookie) {
-      try { await flux.storage.set(AUTH_COOKIE_KEY, profileCookie); } catch (e) {}
-      return await appendStoredBfeId(profileCookie);
-    }
-  }
-  return '';
+  if (cookie) return await appendStoredBfeId(cookie);
+  var profileCookie = await cookieFromAuthProfile();
+  return profileCookie ? await appendStoredBfeId(profileCookie) : '';
 }
 
 function cookieContains(cookie, name) {
@@ -178,6 +209,7 @@ async function appendStoredBfeId(cookie) {
   } catch (e) {}
   return value;
 }
+
 
 function responseHeader(response, name) {
   var headers = response && response.headers ? response.headers : {};
@@ -223,25 +255,7 @@ function requestHeaders(cookie, ctx) {
   return headers;
 }
 
-function delay(ms) {
-  return new Promise(function(resolve) { setTimeout(resolve, ms); });
-}
 
-async function apiGetWithRetry(path, ctx, cookie, attempts) {
-  var limit = Number(attempts) || 3;
-  var lastError = null;
-  for (var attempt = 0; attempt < limit; attempt++) {
-    try {
-      return await apiGet(path, ctx, cookie);
-    } catch (e) {
-      lastError = e;
-      if (attempt + 1 < limit) {
-        await delay(500 + attempt * 1000);
-      }
-    }
-  }
-  throw lastError || new Error('Bilibili 接口请求失败');
-}
 
 async function apiGet(path, ctx, cookie) {
   var response;
@@ -423,7 +437,7 @@ async function apiGetWbi(path, params, ctx, cookie) {
       lastError = e;
       if (attempt === 0 && /code=(-352|-799)/.test(String(e))) {
         try { await flux.storage.set(WBI_CACHE_KEY, ''); } catch (ignored) {}
-        await delay(800);
+        // Resolver scripts have no global timer; retry the refreshed signature immediately.
         continue;
       }
       break;

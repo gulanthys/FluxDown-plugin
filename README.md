@@ -40,7 +40,7 @@ FluxDown-plugin/
 
 | 插件 | FluxDown identity | 版本 | 功能 |
 | --- | --- | --- | --- |
-| [bilibili-bangumi](./bilibili-bangumi/) | `fluxdown@bilibili-bangumi` | `1.0.2` | 解析 Bilibili 番剧、普通视频及短链，并提供番剧和 UP 主投稿订阅 |
+| [bilibili-bangumi](./bilibili-bangumi/) | `fluxdown@bilibili-bangumi` | `1.1.0` | 解析番剧、普通视频及短链；番剧和 UP 主订阅独立配置；可移植二维码登录及登录态恢复（FD ≥ 0.6.4） |
 
 ## 插件包格式
 
@@ -54,7 +54,7 @@ plugin.fxplug
 
 安装器会读取并校验 `manifest.json`，然后将插件安装到 FluxDown 的插件目录中。开发目录安装则要求选择直接包含 `manifest.json` 的插件目录。
 
-当前 Flutter 客户端的 ZIP 文件选择器只显示 `.zip` 扩展名。安装 `.fxplug` 时，可临时将扩展名改为 `.zip`；文件内容不需要修改，也不要重复压缩。
+当前 GPUI 与 Web 客户端可直接安装 `.fxplug`；发布包须包含 manifest 声明的 `resolve.js`、`auth.js` 和 `main.js`。
 
 ## 开发与维护流程
 

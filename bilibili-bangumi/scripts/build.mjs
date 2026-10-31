@@ -9,3 +9,14 @@ const parts = ["runtime.js", "bangumi.js", "dash.js", "subscriptions.js", "entry
 const output = parts.map((name) => readFileSync(join(sourceDir, name), "utf8").trimEnd()).join("\n\n") + "\n";
 writeFileSync(join(pluginDir, "resolve.js"), output, "utf8");
 console.log(`built resolve.js from ${parts.length} source files`);
+
+const mainParts = [
+  join(pluginDir, "auth.js"),
+  join(pluginDir, "vendor", "qrcode.js"),
+  join(sourceDir, "qr-image.js"),
+  join(sourceDir, "auth-view.js"),
+];
+const license = readFileSync(join(pluginDir, "vendor", "LICENSE-qrcode"), "utf8");
+const main = "/*\n" + license + "*/\n" + mainParts.map((path) => readFileSync(path, "utf8").trimEnd()).join("\n\n") + "\n";
+writeFileSync(join(pluginDir, "main.js"), main, "utf8");
+console.log("built main.js with portable QR login view");

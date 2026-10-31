@@ -5,6 +5,8 @@
 
 var PASSPORT_BASE = 'https://passport.bilibili.com';
 var DEFAULT_SITE = 'api.bilibili.com';
+var FIXED_SITES = [DEFAULT_SITE, 'passport.bilibili.com', 'www.bilibili.com'];
+var QR_TTL_MS = 180000; // Bilibili 二维码通常有效 180 秒。
 var SESSION_KEY = 'bilibili.auth.session';
 var USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
   '(KHTML, like Gecko) Chrome/131.0 Safari/537.36';
@@ -64,6 +66,7 @@ async function request(method, url, options) {
     url: url,
     headers: opts.headers || headers(opts.cookie || ''),
     body: opts.body,
+    authRef: opts.authRef,
   });
   var payload = null;
   try {
@@ -161,23 +164,45 @@ function resultError(payload) {
     String((payload && payload.data && payload.data.message) || (payload && payload.message) || 'unknown');
 }
 
+function normalizedSite(site) {
+  var value = String(site || '').trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+  return value ? 'https://' + value : '';
+}
+
+function canonicalRef(site) {
+  var normalized = normalizedSite(site);
+  return normalized ? 'fluxdown@bilibili-bangumi::' + normalized : '';
+}
+
+function normalizeRef(ref) {
+  var value = String(ref || '');
+  var separator = value.indexOf('::');
+  return separator < 0 ? value : canonicalRef(value.slice(separator + 2));
+}
+
+async function storedRefs() {
+  var refs = [];
+  try {
+    var raw = await flux.storage.get('auth.refs');
+    var parsed = raw ? JSON.parse(raw) : [];
+    if (Array.isArray(parsed)) refs = parsed.map(normalizeRef).filter(Boolean);
+  } catch (e) {}
+  if (!refs.length) refs = FIXED_SITES.map(canonicalRef);
+  return refs;
+}
+
 async function saveAuth(cookie, account) {
   if (!cookie) throw new Error('Bilibili 登录成功但未取得 Cookie，请重新扫码');
-  // Bilibili 的播放接口需要 SESSDATA 才会按登录用户返回完整画质。
-  if (!/(?:^|;\s*)SESSDATA=/i.test(cookie)) {
-    throw new Error('Bilibili 登录成功但未取得 SESSDATA，请重新扫码');
-  }
-  var sites = [DEFAULT_SITE, 'passport.bilibili.com', 'www.bilibili.com'];
-  var requested = String(account && account.site || '').trim();
-  if (requested) sites.unshift(requested);
+  if (!/(?:^|;\s*)SESSDATA=/i.test(cookie)) throw new Error('Bilibili 登录成功但未取得 SESSDATA，请重新扫码');
+  var sites = FIXED_SITES.slice();
+  var requested = normalizedSite(account && account.site);
+  if (requested && sites.map(normalizedSite).indexOf(requested) < 0) sites.push(requested);
   var refs = [];
+  var primaryError = null;
   for (var i = 0; i < sites.length; i++) {
-    var site = sites[i];
-    var duplicate = false;
-    for (var j = 0; j < i; j++) if (sites[j] === site) duplicate = true;
-    if (duplicate) continue;
+    var site = normalizedSite(sites[i]);
     try {
-      var authRef = await flux.auth.save({
+      var ref = await flux.auth.save({
         site: site,
         kind: 'cookie',
         account: String(account && account.username || ''),
@@ -185,78 +210,100 @@ async function saveAuth(cookie, account) {
         refreshToken: '',
         metadata: { provider: 'bilibili', login: 'qrcode' },
       });
-      refs.push(String(authRef || ''));
-    } catch (e) {}
+      if (ref) refs.push(String(ref));
+      else if (site === normalizedSite(DEFAULT_SITE)) primaryError = new Error('FD 未返回认证引用');
+    } catch (e) {
+      if (site === normalizedSite(DEFAULT_SITE)) primaryError = e;
+    }
   }
-  if (!refs.length) throw new Error('登录成功，但 FD 未能保存 Bilibili 认证档案');
-  try { await flux.storage.set('auth.refs', JSON.stringify(refs)); } catch (e) {}
-  // 兼容插件旧版 resolver：同时缓存规范化 Cookie；新请求仍由 flux.auth 注入。
-  try { await flux.storage.set('auth.cookie', cookie); } catch (e) {}
-  return refs[0];
+  try {
+    await flux.storage.set('auth.refs', JSON.stringify(refs));
+  } catch (e) {
+    throw new Error('登录成功，但无法保存认证引用索引');
+  }
+  try { await flux.storage.set('auth.cookie', ''); } catch (e) {
+    throw new Error('认证档案已保存，但无法清理旧 Cookie 缓存');
+  }
+  if (primaryError) throw new Error('登录成功，但 FD 未能保存 api.bilibili.com 认证档案');
+  return refs[0] || canonicalRef(DEFAULT_SITE);
 }
 
 async function logoutAuth(authRef) {
-  var refs = [];
-  try {
-    var raw = await flux.storage.get('auth.refs');
-    var parsed = raw ? JSON.parse(raw) : [];
-    if (Array.isArray(parsed)) refs = parsed;
-  } catch (e) {}
-  if (authRef && refs.indexOf(authRef) < 0) refs.push(authRef);
+  var refs = await storedRefs();
+  var requestedRef = normalizeRef(authRef);
+  if (requestedRef && refs.indexOf(requestedRef) < 0) refs.push(requestedRef);
+  var failed = [];
+  var errors = [];
   for (var i = 0; i < refs.length; i++) {
-    if (!refs[i]) continue;
-    try { await flux.auth.remove(String(refs[i])); } catch (e) {}
+    try { await flux.auth.remove(String(refs[i])); } catch (e) {
+      failed.push(String(refs[i]));
+      errors.push(String(e && e.message || e));
+    }
   }
-  try { await flux.storage.set('auth.refs', ''); } catch (e) {}
-  try { await flux.storage.set('auth.cookie', ''); } catch (e) {}
-  await clearSession();
-  return {
-    status: 'success',
-    sessionId: '',
-    authRef: null,
-    message: 'Bilibili 已注销，认证状态已清除。',
+  try { await flux.storage.set('auth.refs', JSON.stringify(failed)); } catch (e) {
+    throw new Error('注销失败，且无法保存未删除认证引用：' + String(e && e.message || e));
+  }
+  try { await flux.storage.set('auth.cookie', ''); } catch (e) {
+    errors.push('旧 Cookie 缓存清理失败：' + String(e && e.message || e));
+  }
+  try { await clearSession(); } catch (e) { errors.push('登录会话清理失败：' + String(e && e.message || e)); }
+  if (failed.length || errors.length) return {
+    status: 'error', sessionId: '', authRef: null,
+    message: 'Bilibili 注销未完成：' + errors.join('; '),
   };
+  return { status: 'success', sessionId: '', authRef: null, message: 'Bilibili 已注销，认证状态已清除。' };
 }
 
 async function statusAuth() {
   var session = await loadSession();
   if (session && session.kind === 'qrcode' && session.challenge) {
-    return pendingResult(
-      session,
-      session.challenge,
-      '请用 Bilibili App 扫描上面的二维码；系统会自动检查登录状态。',
-      'qrcode',
-    );
+    if (Date.now() - Number(session.createdAt || 0) >= QR_TTL_MS) {
+      await clearSession();
+    } else {
+      return pendingResult(
+        session,
+        session.challenge,
+        '请用 Bilibili App 扫描上面的二维码；系统会自动检查登录状态。',
+        'qrcode',
+      );
+    }
   }
-
-  var refs = [];
+  var apiRef = canonicalRef(DEFAULT_SITE);
+  var refs = await storedRefs();
+  if (refs.indexOf(apiRef) < 0) return { status: 'error', sessionId: '', message: '' };
+  var profile;
   try {
-    var raw = await flux.storage.get('auth.refs');
-    var parsed = raw ? JSON.parse(raw) : [];
-    if (Array.isArray(parsed)) refs = parsed;
-  } catch (e) {}
-
-  // 兼容早期版本：旧版没有保存 auth.refs，但会留下规范化 Cookie。
-  if (!refs.length) {
-    try {
-      var cookie = await flux.storage.get('auth.cookie');
-      if (cookie) refs.push('fluxdown@bilibili-bangumi::api.bilibili.com');
-    } catch (e) {}
+    profile = await flux.auth.get(apiRef);
+  } catch (e) {
+    return { status: 'error', sessionId: '', message: '无法检查 Bilibili 登录状态，请稍后重试。' };
   }
-
-  for (var i = 0; i < refs.length; i++) {
-    if (!refs[i]) continue;
-    try {
-      var profile = await flux.auth.get(String(refs[i]));
-      if (profile && /(?:^|;\s*)SESSDATA=/i.test(String(profile.cookies || ''))) {
-        return successResult('', String(refs[i]));
-      }
-    } catch (e) {}
+  var expiresAt = Number(profile && profile.expiresAt) || 0;
+  var cookie = String(profile && profile.cookies || '');
+  if (!profile || (expiresAt && expiresAt <= Math.floor(Date.now() / 1000)) ||
+      !/(?:^|;\s*)SESSDATA=/i.test(cookie)) {
+    return { status: 'error', sessionId: '', message: 'Bilibili 登录已失效，请重新扫码登录。' };
   }
-
-  // 未登录不是异常，UI 会据此显示二维码登录入口。
-  return { status: 'error', sessionId: '', message: '' };
+  try {
+    var result = await request('GET', 'https://api.bilibili.com/x/web-interface/nav', {
+      cookie: cookie,
+      authRef: apiRef,
+    });
+    if (Number(result.response.status) < 200 || Number(result.response.status) >= 300) {
+      return { status: 'error', sessionId: '', message: '无法检查 Bilibili 登录状态，请稍后重试。' };
+    }
+    var code = Number(result.payload.code);
+    if (code === -101 || (code === 0 && result.payload.data && result.payload.data.isLogin === false)) {
+      return { status: 'error', sessionId: '', message: 'Bilibili 登录已失效，请重新扫码登录。' };
+    }
+    if (code !== 0 || !result.payload.data || result.payload.data.isLogin !== true) {
+      return { status: 'error', sessionId: '', message: '无法检查 Bilibili 登录状态，请稍后重试。' };
+    }
+    return successResult('', apiRef);
+  } catch (e) {
+    return { status: 'error', sessionId: '', message: '无法检查 Bilibili 登录状态，请稍后重试。' };
+  }
 }
+
 
 function successResult(sessionId, authRef) {
   return {
@@ -296,6 +343,10 @@ async function beginQr(ctx) {
 }
 
 async function pollQr(session) {
+  if (Date.now() - Number(session.createdAt || 0) >= QR_TTL_MS) {
+    await clearSession();
+    return { status: 'error', sessionId: '', message: '二维码已过期，请重新开始二维码登录。' };
+  }
   var result = await request('GET', PASSPORT_BASE + '/x/passport-login/web/qrcode/poll?qrcode_key=' + encodeURIComponent(session.qrcodeKey), {
     cookie: session.cookie || '',
   });

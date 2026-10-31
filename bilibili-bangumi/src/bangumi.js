@@ -193,9 +193,9 @@ async function collectEpisodes(result, includeExtras, ctx, cookie, quality) {
     if (episodes.length >= MAX_EPISODES) break;
   }
   disambiguateEpisodeNames(episodes);
-  if (!episodes.length || !ctx) return episodes.map(function(episode) {
+  if (!episodes.length || !ctx) return fitManifestItems(episodes.map(function(episode) {
     return { id: 'ep:' + episode.id, name: episode.baseName, path: episode.path, size: 0, kind: 'file' };
-  });
+  }));
 
   // Resolve every episode. The current FluxDown manifest UI does not expose
   // nested item.variants, so quality choices must remain flat manifest items.
@@ -204,31 +204,39 @@ async function collectEpisodes(result, includeExtras, ctx, cookie, quality) {
   var qualityVariants = new Array(hintLimit);
   var highestQualityOnly = Boolean(setting('highestQualityOnly', false));
   var nextIndex = 0;
+  var failed = 0;
   async function worker() {
     while (true) {
       var index = nextIndex++;
       if (index >= hintLimit) return;
       try {
-        var play = await apiGetWithRetry(playerPlayUrl(episodes[index]), ctx, cookie, 3);
+        var play = await apiGet(playerPlayUrl(episodes[index]), ctx, cookie);
         var variants = buildManifestVariantsFromPlay(play, 'quality');
         qualityVariants[index] = selectListedQualityVariants(variants, highestQualityOnly);
-      } catch (e) { qualityVariants[index] = []; }
+        if (!qualityVariants[index].length) failed++;
+      } catch (e) {
+        qualityVariants[index] = [];
+        failed++;
+      }
     }
   }
   var workers = Math.min(6, hintLimit);
   var jobs = [];
   for (var wi = 0; wi < workers; wi++) jobs.push(worker());
   await Promise.all(jobs);
+  if (failed) pluginLog('warn', '[bilibili] manifest quality enumeration failures; unresolved episodes remain selectable', { failed: failed, total: episodes.length });
 
   var items = buildEpisodeItems(episodes, qualityVariants);
   if (items.length > MAX_EPISODES) {
     // The host rejects a flat manifest above MAX_EPISODES. Keep the all-quality
     // mode for shorter seasons, but make long seasons resolvable by falling
     // back to one real, downloadable variant per episode.
+    var originalCount = items.length;
     var bestQualityVariants = qualityVariants.map(function(variants) {
       return selectListedQualityVariants(variants || [], true);
     });
     items = buildEpisodeItems(episodes, bestQualityVariants);
+    pluginLog('warn', '[bilibili] manifest quality choices reduced to host limit', { before: originalCount, after: items.length, limit: MAX_EPISODES });
   }
   return items;
 }
@@ -263,15 +271,7 @@ async function resolveEpisode(ctx) {
   // 清单项带有具体画质码时，下载阶段直接请求该 qn；
   // qn=127 只用于列出可选画质，不能保证每次都返回同一条资源。
   var requestedQualityId = /^\d+$/.test(qualityKey) ? Number(qualityKey) : 0;
-  var play = null;
-  if (requestedQualityId) {
-    try {
-      play = await apiGet(playerPlayUrl({ id: epId, bvid: episode && episode.bvid, cid: episode && episode.cid }, requestedQualityId), ctx, cookie);
-    } catch (e) {
-      play = null;
-    }
-  }
-  if (!play) play = await apiGet(playerPlayUrl({ id: epId, bvid: episode && episode.bvid, cid: episode && episode.cid }), ctx, cookie);
+  var play = await apiGet(playerPlayUrl({ id: epId }, requestedQualityId), ctx, cookie);
   if (play.code != null && Number(play.code) !== 0) {
     throw new Error('Bilibili 播放接口错误 code=' + String(play.code));
   }

@@ -5,16 +5,16 @@
 //   2. manifest 条目启动时 → 用 resolverItem(ep:<id>) 调 B 站播放接口取得 DASH
 //      视频/音频短期直链，再交回 FluxDown 下载引擎。
 //
-// 订阅轮询不放在插件内：当前插件契约没有后台 timer 或主动 createTask API。
-// 因此本插件保持独立、无 Rust 修改，先负责稳定的「分集发现 + 单集解析」。
+// 追番与 UP 主更新由 FluxDown 的 subscribe 契约调度；插件只负责返回有限批次，
+// 不创建后台定时器或直接建下载任务。
 
 var API_BASE = 'https://api.bilibili.com';
 var USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
   '(KHTML, like Gecko) Chrome/131.0 Safari/537.36';
 var MAX_EPISODES = 1000;
 var MAX_VARIANTS = 16;
-var AUTH_COOKIE_KEY = 'auth.cookie';
 var BFE_ID_KEY = 'auth.bfe_id';
+var MAX_MANIFEST_PATH_CHARS = 180;
 // bili32 使用通用播放器接口时携带的 session 参数；番剧分集也能通过
 // bvid + cid 走同一接口，并返回完整的 DASH 画质列表。
 var PLAYER_SESSION = '68191c1dc3c75042c6f35fba895d65b0';
@@ -72,23 +72,59 @@ function logAuthDiagnostics(source, cookie, payload) {
   pluginLog('info', '[bilibili] auth diagnostics', { source: source, hasSessdata: cookieContains(cookie, 'SESSDATA'), isLogin: data.isLogin === true, hasWbiImage: Boolean(data.wbi_img && data.wbi_img.img_url && data.wbi_img.sub_url) });
 }
 
+function truncateCodePoints(value, maxLength) {
+  return Array.from(String(value || '')).slice(0, Math.max(0, maxLength)).join('');
+}
+
 function sanitizeFileName(name) {
-  return (name || 'video')
+  return truncateCodePoints((name || 'video')
     .replace(/[\\/:*?"<>|\u0000-\u001f]/g, ' ')
     .replace(/\.{2,}/g, '.')
     .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, 120) || 'video';
+    .trim(), 120) || 'video';
 }
 
 function sanitizePath(name) {
   var value = sanitizeFileName(name).replace(/[.]/g, ' ');
-  return value.slice(0, 80).trim();
+  return truncateCodePoints(value, 80).trim();
 }
+
+
+function fitManifestItems(items) {
+  var usedNames = Object.create(null);
+  return items.map(function(item) {
+    var path = String(item.path || '');
+    var pathLength = Array.from(path).length;
+    var nameBudget = MAX_MANIFEST_PATH_CHARS - pathLength - (path ? 1 : 0);
+    if (nameBudget < 1) throw new Error('番剧目录名超过 FluxDown 清单路径长度上限');
+    var rawName = String(item.name || 'video');
+    var dot = rawName.lastIndexOf('.');
+    var extension = dot > 0 ? rawName.slice(dot) : '';
+    if (Array.from(extension).length >= nameBudget) throw new Error('番剧文件扩展名超过 FluxDown 清单路径长度上限');
+    var stem = extension ? rawName.slice(0, dot) : rawName;
+    var pathKey = path.toLowerCase();
+    if (!usedNames[pathKey]) usedNames[pathKey] = Object.create(null);
+    var names = usedNames[pathKey];
+    var candidate = '';
+    for (var duplicate = 1; duplicate <= 10000; duplicate++) {
+      var suffix = duplicate === 1 ? '' : ' (' + duplicate + ')';
+      var stemBudget = nameBudget - Array.from(extension + suffix).length;
+      if (stemBudget < 1) throw new Error('同目录中的番剧文件名无法唯一化');
+      candidate = truncateCodePoints(stem, stemBudget) + suffix + extension;
+      if (!names[candidate.toLowerCase()]) break;
+      candidate = '';
+    }
+    if (!candidate) throw new Error('同目录中的番剧文件名数量超过上限');
+    names[candidate.toLowerCase()] = true;
+    return Object.assign({}, item, { name: candidate });
+  });
+}
+
 
 function cookieHeaderFromNetscape(raw) {
   var lines = String(raw || '').split(/\r?\n/);
   var pairs = [];
+  var now = Math.floor(Date.now() / 1000);
   for (var i = 0; i < lines.length; i++) {
     var line = lines[i].trim();
     if (!line) continue;
@@ -96,9 +132,18 @@ function cookieHeaderFromNetscape(raw) {
     if (line.indexOf('#HttpOnly_') === 0) line = line.slice('#HttpOnly_'.length);
     else if (line[0] === '#') continue;
     var fields = line.split('\t');
-    if (fields.length >= 7 && fields[5]) {
-      pairs.push(fields[5] + '=' + fields.slice(6).join('\t'));
-    }
+    if (fields.length < 7 || !fields[5]) continue;
+    var rawDomain = String(fields[0] || '').toLowerCase();
+    var domain = rawDomain.replace(/^\./, '');
+    var apiHost = 'api.bilibili.com';
+    var includeSubdomains = String(fields[1]).toUpperCase() === 'TRUE';
+    var belongsToBilibili = domain === 'bilibili.com' || domain.endsWith('.bilibili.com');
+    var domainMatches = belongsToBilibili && (domain === apiHost || (includeSubdomains && apiHost.endsWith('.' + domain)));
+    var cookiePath = String(fields[2] || '/');
+    var secure = String(fields[3]).toUpperCase() === 'TRUE';
+    var expires = Number(fields[4]) || 0;
+    if (!domainMatches || cookiePath !== '/' || (secure && !API_BASE.startsWith('https://')) || (expires > 0 && expires <= now)) continue;
+    pairs.push(fields[5] + '=' + fields.slice(6).join('\t'));
   }
   return pairs.join('; ');
 }
@@ -120,49 +165,35 @@ function normalizeSessdataCookie(cookie) {
 
 async function cookieFromAuthProfile() {
   if (!flux.auth || typeof flux.auth.get !== 'function') return '';
-  var refs = [];
+  var apiAuthRef = 'fluxdown@bilibili-bangumi::https://api.bilibili.com';
   try {
     var raw = await flux.storage.get('auth.refs');
     var parsed = raw ? JSON.parse(raw) : [];
-    if (Array.isArray(parsed)) refs = parsed.slice();
+    if (Array.isArray(parsed)) {
+      var hasApiRef = parsed.some(function(ref) {
+        return String(ref || '').replace('::api.bilibili.com', '::https://api.bilibili.com') === apiAuthRef;
+      });
+      if (parsed.length && !hasApiRef) return '';
+    }
   } catch (e) {}
-  if (!refs.length) refs.push('fluxdown@bilibili-bangumi::api.bilibili.com');
-  for (var i = 0; i < refs.length; i++) {
-    if (!refs[i]) continue;
-    try {
-      var profile = await flux.auth.get(String(refs[i]));
-      var profileCookie = cookieHeader(profile && profile.cookies || '');
+  try {
+    var profile = await flux.auth.get(apiAuthRef);
+    var expiresAt = Number(profile && profile.expiresAt) || 0;
+    if (profile && (!expiresAt || expiresAt > Math.floor(Date.now() / 1000))) {
+      var profileCookie = cookieHeader(profile.cookies || '');
       if (/(?:^|;\s*)SESSDATA=/i.test(profileCookie)) return profileCookie;
-    } catch (e) {}
-  }
+    }
+  } catch (e) {}
   return '';
 }
+
 async function effectiveCookie(ctx) {
   var raw = String((ctx && ctx.cookies) || '').trim();
   if (!raw) raw = String(setting('cookies', '') || '').trim();
   var cookie = normalizeSessdataCookie(cookieHeader(raw));
-
-  // 显式输入优先于缓存。首次解析时保存规范化后的 Cookie，后续任务可以复用。
-  if (cookie) {
-    try {
-      var previous = await flux.storage.get(AUTH_COOKIE_KEY);
-      if (previous !== cookie) await flux.storage.set(AUTH_COOKIE_KEY, cookie);
-    } catch (e) {}
-    return await appendStoredBfeId(cookie);
-  }
-
-  if (setting('reuseStoredSession', true)) {
-    try {
-      var stored = await flux.storage.get(AUTH_COOKIE_KEY);
-      if (stored) return await appendStoredBfeId(String(stored));
-    } catch (e) {}
-    var profileCookie = await cookieFromAuthProfile();
-    if (profileCookie) {
-      try { await flux.storage.set(AUTH_COOKIE_KEY, profileCookie); } catch (e) {}
-      return await appendStoredBfeId(profileCookie);
-    }
-  }
-  return '';
+  if (cookie) return await appendStoredBfeId(cookie);
+  var profileCookie = await cookieFromAuthProfile();
+  return profileCookie ? await appendStoredBfeId(profileCookie) : '';
 }
 
 function cookieContains(cookie, name) {
@@ -178,6 +209,7 @@ async function appendStoredBfeId(cookie) {
   } catch (e) {}
   return value;
 }
+
 
 function responseHeader(response, name) {
   var headers = response && response.headers ? response.headers : {};
@@ -223,25 +255,7 @@ function requestHeaders(cookie, ctx) {
   return headers;
 }
 
-function delay(ms) {
-  return new Promise(function(resolve) { setTimeout(resolve, ms); });
-}
 
-async function apiGetWithRetry(path, ctx, cookie, attempts) {
-  var limit = Number(attempts) || 3;
-  var lastError = null;
-  for (var attempt = 0; attempt < limit; attempt++) {
-    try {
-      return await apiGet(path, ctx, cookie);
-    } catch (e) {
-      lastError = e;
-      if (attempt + 1 < limit) {
-        await delay(500 + attempt * 1000);
-      }
-    }
-  }
-  throw lastError || new Error('Bilibili 接口请求失败');
-}
 
 async function apiGet(path, ctx, cookie) {
   var response;
@@ -423,7 +437,7 @@ async function apiGetWbi(path, params, ctx, cookie) {
       lastError = e;
       if (attempt === 0 && /code=(-352|-799)/.test(String(e))) {
         try { await flux.storage.set(WBI_CACHE_KEY, ''); } catch (ignored) {}
-        await delay(800);
+        // Resolver scripts have no global timer; retry the refreshed signature immediately.
         continue;
       }
       break;
@@ -703,9 +717,9 @@ async function collectEpisodes(result, includeExtras, ctx, cookie, quality) {
     if (episodes.length >= MAX_EPISODES) break;
   }
   disambiguateEpisodeNames(episodes);
-  if (!episodes.length || !ctx) return episodes.map(function(episode) {
+  if (!episodes.length || !ctx) return fitManifestItems(episodes.map(function(episode) {
     return { id: 'ep:' + episode.id, name: episode.baseName, path: episode.path, size: 0, kind: 'file' };
-  });
+  }));
 
   // Resolve every episode. The current FluxDown manifest UI does not expose
   // nested item.variants, so quality choices must remain flat manifest items.
@@ -714,31 +728,39 @@ async function collectEpisodes(result, includeExtras, ctx, cookie, quality) {
   var qualityVariants = new Array(hintLimit);
   var highestQualityOnly = Boolean(setting('highestQualityOnly', false));
   var nextIndex = 0;
+  var failed = 0;
   async function worker() {
     while (true) {
       var index = nextIndex++;
       if (index >= hintLimit) return;
       try {
-        var play = await apiGetWithRetry(playerPlayUrl(episodes[index]), ctx, cookie, 3);
+        var play = await apiGet(playerPlayUrl(episodes[index]), ctx, cookie);
         var variants = buildManifestVariantsFromPlay(play, 'quality');
         qualityVariants[index] = selectListedQualityVariants(variants, highestQualityOnly);
-      } catch (e) { qualityVariants[index] = []; }
+        if (!qualityVariants[index].length) failed++;
+      } catch (e) {
+        qualityVariants[index] = [];
+        failed++;
+      }
     }
   }
   var workers = Math.min(6, hintLimit);
   var jobs = [];
   for (var wi = 0; wi < workers; wi++) jobs.push(worker());
   await Promise.all(jobs);
+  if (failed) pluginLog('warn', '[bilibili] manifest quality enumeration failures; unresolved episodes remain selectable', { failed: failed, total: episodes.length });
 
   var items = buildEpisodeItems(episodes, qualityVariants);
   if (items.length > MAX_EPISODES) {
     // The host rejects a flat manifest above MAX_EPISODES. Keep the all-quality
     // mode for shorter seasons, but make long seasons resolvable by falling
     // back to one real, downloadable variant per episode.
+    var originalCount = items.length;
     var bestQualityVariants = qualityVariants.map(function(variants) {
       return selectListedQualityVariants(variants || [], true);
     });
     items = buildEpisodeItems(episodes, bestQualityVariants);
+    pluginLog('warn', '[bilibili] manifest quality choices reduced to host limit', { before: originalCount, after: items.length, limit: MAX_EPISODES });
   }
   return items;
 }
@@ -773,15 +795,7 @@ async function resolveEpisode(ctx) {
   // 清单项带有具体画质码时，下载阶段直接请求该 qn；
   // qn=127 只用于列出可选画质，不能保证每次都返回同一条资源。
   var requestedQualityId = /^\d+$/.test(qualityKey) ? Number(qualityKey) : 0;
-  var play = null;
-  if (requestedQualityId) {
-    try {
-      play = await apiGet(playerPlayUrl({ id: epId, bvid: episode && episode.bvid, cid: episode && episode.cid }, requestedQualityId), ctx, cookie);
-    } catch (e) {
-      play = null;
-    }
-  }
-  if (!play) play = await apiGet(playerPlayUrl({ id: epId, bvid: episode && episode.bvid, cid: episode && episode.cid }), ctx, cookie);
+  var play = await apiGet(playerPlayUrl({ id: epId }, requestedQualityId), ctx, cookie);
   if (play.code != null && Number(play.code) !== 0) {
     throw new Error('Bilibili 播放接口错误 code=' + String(play.code));
   }
@@ -895,20 +909,40 @@ function streamSize(stream) {
   return value > 0 ? value : 0;
 }
 
+function mediaMime(stream) {
+  return String(stream && (stream.mime_type || stream.mimeType) || '').toLowerCase().split(';')[0].trim();
+}
+
+function isMp4CompatibleAudio(track) {
+  var mime = mediaMime(track);
+  return !mime || mime === 'audio/mp4';
+}
+
 function pickAudioTrack(audios) {
   var best = null;
   var score = -1;
+  var hasUsableUrl = false;
   for (var i = 0; i < audios.length; i++) {
     var track = audios[i];
     if (!track || !streamUrl(track)) continue;
+    hasUsableUrl = true;
+    if (!isMp4CompatibleAudio(track)) continue;
     var current = Number(track.bandwidth) || Number(track.id) || 0;
     if (current > score) {
       score = current;
       best = track;
     }
   }
+  if (!best && hasUsableUrl) throw new Error('Bilibili 返回了不兼容 MP4/M4A 封装的音轨');
   return best;
 }
+
+function videoContainer(video) {
+  var mime = mediaMime(video);
+  if (!mime || mime === 'video/mp4') return 'mp4';
+  throw new Error('Bilibili 返回了非 MP4 视频流，当前下载器不能在不转码的情况下封装：' + mime);
+}
+
 
 function videoHeight(video) {
   var height = Number(video.height) || Number(video.height_cm) || 0;
@@ -980,16 +1014,17 @@ function buildDashVariants(videos, audio, title, play) {
     var video = item.video;
     var label = videoQualityLabel(video, item.height, play);
     var tag = variantQualityTag({ label: label, qualityId: Number(video.id) || Number(video.quality) || 0, height: item.height });
+    var container = videoContainer(video);
     var variant = {
       label: label,
       url: streamUrl(video),
-      fileName: title + ' [' + tag + '].mp4',
+      fileName: title + ' [' + tag + '].' + container,
       qualityId: Number(video.id) || Number(video.quality) || 0,
       totalBytes: streamSize(video) + streamSize(audio),
       bandwidth: Number(video.bandwidth) || 0,
       width: Number(video.width) || 0,
       height: item.height,
-      container: 'mp4',
+      container: container,
     };
     if (audio) variant.audioUrl = audioUrl(audio);
     variants.push(variant);
@@ -1024,6 +1059,7 @@ function buildDurlVariants(play, title) {
   for (var i = 0; i < entries.length; i++) {
     var source = entries[i] || {};
     var parts = Array.isArray(source.durl) ? source.durl : [];
+    if (parts.length > 1) throw new Error('Bilibili 返回分段 durl，插件尚不支持完整分段合并；拒绝只下载首段');
     var part = parts[0] || source;
     var url = String(part.url || '');
     var qualityId = Number(source.quality || part.quality || play.quality || 0);
@@ -1128,20 +1164,21 @@ function buildEpisodeItems(episodes, qualityVariants) {
     }
     if (!added) items.push({ id: 'ep:' + episode.id, name: episode.baseName + '.mp4', path: episode.path, size: 0, kind: 'file' });
   }
-  return items;
+  return fitManifestItems(items);
 }
 
 function chooseDashIndex(variants, quality) {
-  if (!variants.length) return 0;
+  if (!variants.length) throw new Error('Bilibili 未返回可用画质');
   if (quality === 'audio') {
     for (var i = 0; i < variants.length; i++) {
       if (variants[i].height === 0) return i;
     }
-    return 0;
+    throw new Error('Bilibili 当前没有独立音频轨');
   }
   if (quality === 'best') return 0;
-  var target = Number(quality) || 1080;
-  var best = 0;
+  var target = Number(quality);
+  if (!(target > 0)) throw new Error('不支持的画质设置: ' + String(quality));
+  var best = -1;
   var bestHeight = 0;
   for (var j = 0; j < variants.length; j++) {
     var height = Number(variants[j].height) || 0;
@@ -1150,11 +1187,68 @@ function chooseDashIndex(variants, quality) {
       bestHeight = height;
     }
   }
+  if (best < 0) throw new Error('Bilibili 没有不超过 ' + target + 'p 的可用画质');
   return best;
 }
 
 // 订阅轮询会直接为条目建任务，单次只解析最近一批分集，避免长篇番剧或大量番外
 // 让一次订阅调用超过宿主的墙钟预算。核心会保留已知 guid，后续轮询继续尝试最新分集。
+function subscriptionOptions(ctx, kind) {
+  var config = ctx && ctx.providerConfig;
+  if (config == null || config === '') config = {};
+  if (typeof config === 'string') {
+    try { config = config.trim() ? JSON.parse(config) : {}; } catch (e) { throw new Error('订阅 providerConfig 必须是合法 JSON 对象'); }
+  }
+  if (typeof config !== 'object' || Array.isArray(config) || config === null) throw new Error('订阅 providerConfig 必须是对象');
+  var defaultQuality = kind === 'uploader' ? 'best' : setting('quality', 'best');
+  if (defaultQuality === 'audio') defaultQuality = 'best';
+  var defaults = {
+    quality: defaultQuality,
+    includeExtras: setting('includeExtras', false),
+    highestQualityOnly: kind === 'uploader' ? true : setting('highestQualityOnly', false),
+    limit: setting('limit', kind === 'uploader' ? 20 : MAX_SUBSCRIPTION_EPISODES),
+  };
+  var options = {};
+  var keys = ['quality', 'includeExtras', 'highestQualityOnly', 'limit'];
+  for (var i = 0; i < keys.length; i++) {
+    var key = keys[i];
+    var value = Object.prototype.hasOwnProperty.call(config, key) ? config[key] : defaults[key];
+    if (key === 'quality') {
+      if (typeof value !== 'string' || !/^(best|2160|1440|1080|720|480)$/.test(value)) {
+        throw new Error('订阅 quality 必须是 best、2160、1440、1080、720 或 480（暂不支持 audio）');
+      }
+    } else if (key === 'includeExtras' || key === 'highestQualityOnly') {
+      if (typeof value !== 'boolean') throw new Error('订阅 ' + key + ' 必须是 boolean');
+    } else {
+      var max = kind === 'uploader' ? 30 : 50;
+      var min = 1;
+      if (!Number.isInteger(value) || value < min || value > max) throw new Error('订阅 limit 必须是 ' + min + '..' + max + ' 的整数');
+    }
+    options[key] = value;
+  }
+  return options;
+}
+
+function subscriptionQualityCandidates(play, title, highestQualityOnly, quality) {
+  var candidates = [];
+  var variants = buildManifestVariantsFromPlay(play, title);
+  var ceiling = quality && quality !== 'best' ? Number(quality) : 0;
+  if (ceiling) variants = variants.filter(function(variant) { return Number(variant.height) <= ceiling; });
+  variants = selectListedQualityVariants(variants, Boolean(highestQualityOnly || ceiling));
+  for (var i = 0; i < variants.length; i++) {
+    var variant = variants[i] || {};
+    var qualityId = Number(variant.qualityId) || 0;
+    var height = Number(variant.height) || 0;
+    if (!qualityId || !height) continue;
+    candidates.push({
+      qualityId: qualityId,
+      height: height,
+      label: variant.label,
+      totalBytes: Number(variant.totalBytes) > 0 ? Number(variant.totalBytes) : 0,
+    });
+  }
+  return candidates;
+}
 var MAX_SUBSCRIPTION_EPISODES = 50;
 
 function subscriptionItemTitle(seriesTitle, name, variant) {
@@ -1185,23 +1279,6 @@ function subscriptionEpisodeGroups(result, includeExtras) {
   return groups;
 }
 
-function subscriptionQualityCandidates(play, title) {
-  var candidates = [];
-  var variants = selectListedQualityVariants(buildManifestVariantsFromPlay(play, title), arguments.length > 2 ? Boolean(arguments[2]) : Boolean(setting('highestQualityOnly', false)));
-  for (var i = 0; i < variants.length; i++) {
-    var variant = variants[i] || {};
-    var qualityId = Number(variant.qualityId) || 0;
-    var height = Number(variant.height) || 0;
-    if (!qualityId || !height) continue;
-    candidates.push({
-      qualityId: qualityId,
-      height: height,
-      label: variant.label,
-      totalBytes: Number(variant.totalBytes) > 0 ? Number(variant.totalBytes) : 0,
-    });
-  }
-  return candidates;
-}
 function uploaderMidFromUrl(url) {
   var value = String(url || '').trim();
   var match = /space\.bilibili\.com\/(\d+)/i.exec(value);
@@ -1265,7 +1342,9 @@ async function listUploaderVideos(mid, ctx, cookie, limit) {
   var workers = Math.min(4, normalized.length), jobs = [];
   for (var wi = 0; wi < workers; wi++) jobs.push(worker());
   await Promise.all(jobs);
-  return normalized.filter(function(video) { return video.cid > 0; });
+  var ready = normalized.filter(function(video) { return video.cid > 0; });
+  if (ready.length < normalized.length) pluginLog('warn', '[bilibili] subscription uploader metadata failures', { failed: normalized.length - ready.length, total: normalized.length });
+  return ready;
 }
 async function subscribeUploader(ctx) {
   var mid = uploaderMidFromUrl(ctx.url);
@@ -1274,15 +1353,17 @@ async function subscribeUploader(ctx) {
   var infoResult = await apiGetWbi(uploaderInfoPath(), { mid: mid }, ctx, cookie);
   var info = infoResult && infoResult.card ? infoResult.card : infoResult;
   var uploaderName = sanitizeFileName(String((info && (info.name || info.uname)) || ('UP主 ' + mid)));
-  var limit = 20;
-  var videos = await listUploaderVideos(mid, ctx, cookie, limit);
+  var options = subscriptionOptions(ctx, 'uploader');
+  var videos = await listUploaderVideos(mid, ctx, cookie, options.limit);
   if (!videos.length) throw new Error('Bilibili 未返回可订阅的普通投稿视频');
   var items = [];
+  var failed = 0;
   for (var i = 0; i < videos.length; i++) {
     var video = videos[i];
     try {
       var play = await apiGet(videoPlayUrl(video), ctx, cookie);
-      var variants = subscriptionQualityCandidates(play, video.title, true);
+      var variants = subscriptionQualityCandidates(play, video.title, options.highestQualityOnly, options.quality);
+      if (!variants.length) failed++;
       for (var vi = 0; vi < variants.length; vi++) {
         var variant = variants[vi], qualityKey = String(variant.qualityId);
         items.push({
@@ -1295,8 +1376,10 @@ async function subscribeUploader(ctx) {
           resolverItem: 'video:' + video.bvid + ':cid:' + String(video.cid) + '@q:' + qualityKey,
         });
       }
-    } catch (e) {}
+    } catch (e) { failed++; }
   }
+  if (failed) pluginLog('warn', '[bilibili] subscription uploader item failures', { failed: failed, total: videos.length });
+
   if (!items.length) throw new Error('Bilibili 投稿均未返回可下载画质');
   return { title: 'Bilibili UP主 - ' + uploaderName, link: ctx.url, items: items };
 }
@@ -1326,12 +1409,9 @@ async function resolveUploaderVideo(ctx) {
   var match = /^video:([^:]+):cid:(\d+)(?:@q:(\d+|h\d+))?$/.exec(String(ctx.resolverItem || ''));
   if (!match) throw new Error('Bilibili 投稿视频标识非法: ' + String(ctx.resolverItem || ''));
   var video = { bvid: match[1], cid: Number(match[2]) }, qualityKey = match[3] || '';
-  var cookie = await effectiveCookie(ctx), play = null;
+  var cookie = await effectiveCookie(ctx);
   var requestedQualityId = /^\d+$/.test(qualityKey) ? Number(qualityKey) : 0;
-  if (requestedQualityId) {
-    try { play = await apiGet(videoPlayUrl(video, requestedQualityId), ctx, cookie); } catch (e) {}
-  }
-  if (!play) play = await apiGet(videoPlayUrl(video), ctx, cookie);
+  var play = await apiGet(videoPlayUrl(video, requestedQualityId), ctx, cookie);
   var resolvedTitle = '';
   if (!ctx.title) {
     try {
@@ -1364,9 +1444,12 @@ async function resolveUploaderVideo(ctx) {
 }
 
 async function subscribeBangumi(ctx) {
+  var options = subscriptionOptions(ctx, 'bangumi');
+
   var cookie = await effectiveCookie(ctx);
   var seasonId = await seasonIdFromUrl(ctx.url, ctx, cookie);
   if (!seasonId) throw new Error('无法从 Bilibili 番剧链接识别 season_id 或 media_id');
+
 
   var result = await apiGet(
     '/pgc/view/web/season?season_id=' + encodeURIComponent(seasonId),
@@ -1376,7 +1459,7 @@ async function subscribeBangumi(ctx) {
   var title = sanitizeFileName(result.title || result.season_title || ('Bilibili ' + seasonId));
   var episodes = [];
   var seen = {};
-  var groups = subscriptionEpisodeGroups(result, Boolean(setting('includeExtras', false)));
+  var groups = subscriptionEpisodeGroups(result, options.includeExtras);
   for (var gi = 0; gi < groups.length; gi++) {
     var group = groups[gi];
     for (var ei = 0; ei < group.episodes.length; ei++) {
@@ -1391,8 +1474,9 @@ async function subscribeBangumi(ctx) {
       });
     }
   }
-  if (episodes.length > MAX_SUBSCRIPTION_EPISODES) {
-    episodes = episodes.slice(-MAX_SUBSCRIPTION_EPISODES);
+  if (episodes.length > options.limit) {
+    pluginLog('info', '[bilibili] subscription limited to recent episodes', { total: episodes.length, limit: options.limit });
+    episodes = episodes.slice(-options.limit);
   }
   if (!episodes.length) throw new Error('Bilibili 未返回可订阅分集');
 
@@ -1400,6 +1484,7 @@ async function subscribeBangumi(ctx) {
   // resolverItem 传回本插件二段解析，以复用视频轨 + 音频轨合并逻辑。
   var items = new Array(episodes.length);
   var nextIndex = 0;
+  var failed = 0;
   async function worker() {
     while (true) {
       var index = nextIndex++;
@@ -1407,7 +1492,8 @@ async function subscribeBangumi(ctx) {
       var current = episodes[index];
       try {
         var play = await apiGet(playerPlayUrl(current.episode), ctx, cookie);
-        var candidates = subscriptionQualityCandidates(play, current.name);
+        var candidates = subscriptionQualityCandidates(play, current.name, options.highestQualityOnly, options.quality);
+        if (!candidates.length) failed++;
         for (var qi = 0; qi < candidates.length; qi++) {
           var candidate = candidates[qi];
           var qualityKey = String(candidate.qualityId);
@@ -1430,10 +1516,11 @@ async function subscribeBangumi(ctx) {
           items[index].push(item);
         }
       } catch (e) {
-        // 单集暂时不可访问时跳过；下一次轮询会重新尝试全部画质。
+        failed++;
       }
     }
-  }  var workers = Math.min(6, episodes.length);
+  }
+  var workers = Math.min(6, episodes.length);
   var jobs = [];
   for (var wi = 0; wi < workers; wi++) jobs.push(worker());
   await Promise.all(jobs);
@@ -1444,6 +1531,7 @@ async function subscribeBangumi(ctx) {
       for (var ii = 0; ii < items[ri].length; ii++) ready.push(items[ri][ii]);
     }
   }
+  if (failed) pluginLog('warn', '[bilibili] subscription bangumi item failures', { failed: failed, total: episodes.length });
   if (!ready.length) throw new Error('Bilibili 分集均未返回可下载的单文件直链');
   return {
     title: title,

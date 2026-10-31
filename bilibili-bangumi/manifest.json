@@ -1,13 +1,21 @@
 {
   "identity": "fluxdown@bilibili-bangumi",
   "name": "Bilibili视频下载",
-  "version": "1.0.2",
-  "description": "Bilibili 视频插件：支持番剧、UP 主投稿订阅、DASH 解析、二维码登录及登录态复用。",
+  "version": "1.1.0",
+  "description": "Bilibili 视频插件：支持番剧、UP 主投稿订阅、DASH 解析及二维码登录。",
   "homepage": "https://github.com/gulanthys",
-  "minAppVersion": "0.1.44",
+  "minAppVersion": "0.6.4",
   "permissions": ["auth"],
   "auth": {
     "entry": "auth.js"
+  },
+  "main": {
+    "entry": "main.js"
+  },
+  "contributes": {
+    "views": [
+      { "id": "login", "title": "Bilibili 扫码登录", "location": "auth" }
+    ]
   },
   "resolvers": [
     {
@@ -60,23 +68,15 @@
     {
       "key": "cookies",
       "title": "导入 Bilibili Cookie",
-      "description": "解析时使用的登录态。支持浏览器 Cookie 头或 Netscape cookies.txt；保存后插件会在后续解析中复用。",
+      "description": "解析时使用的登录态。支持浏览器 Cookie 头或 Netscape cookies.txt；保存后会用于后续解析与下载。",
       "type": "string",
       "widget": "textarea",
       "default": ""
     },
     {
-      "key": "reuseStoredSession",
-      "title": "复用已保存登录态",
-      "description": "优先使用插件保存的会话；关闭后每次仅使用上方 Cookie 设置。",
-      "type": "boolean",
-      "widget": "toggle",
-      "default": "true"
-    },
-    {
       "key": "includeExtras",
       "title": "包含番外与花絮",
-      "description": "关闭时只列出正片并排除预告；开启后同时列出预告、PV、采访和其他分区。",
+      "description": "关闭时只列出正片并排除预告；开启后同时列出预告、PV、采访和其他分区。订阅可在 providerConfig 单独覆盖。",
       "type": "boolean",
       "widget": "toggle",
       "default": "false"
@@ -84,7 +84,7 @@
     {
       "key": "highestQualityOnly",
       "title": "优先最高画质",
-      "description": "开启后每集只展示最高可用画质，避免长番剧画质条目超过宿主清单上限；关闭后展示全部可用画质。",
+      "description": "番剧清单每集只展示最高可用画质；订阅可通过 providerConfig 单独覆盖。",
       "type": "boolean",
       "widget": "toggle",
       "default": "false"
@@ -92,7 +92,7 @@
     {
       "key": "quality",
       "title": "默认画质",
-      "description": "普通链接无人值守或选择框超时时使用的画质；番剧订阅返回全部可用画质，请用订阅过滤选择。",
+      "description": "普通链接的默认画质；订阅可通过 providerConfig 单独设置画质上限。没有满足上限的画质时会明确报错。",
       "type": "string",
       "widget": "select",
       "options": [

@@ -16,20 +16,40 @@ function streamSize(stream) {
   return value > 0 ? value : 0;
 }
 
+function mediaMime(stream) {
+  return String(stream && (stream.mime_type || stream.mimeType) || '').toLowerCase().split(';')[0].trim();
+}
+
+function isMp4CompatibleAudio(track) {
+  var mime = mediaMime(track);
+  return !mime || mime === 'audio/mp4';
+}
+
 function pickAudioTrack(audios) {
   var best = null;
   var score = -1;
+  var hasUsableUrl = false;
   for (var i = 0; i < audios.length; i++) {
     var track = audios[i];
     if (!track || !streamUrl(track)) continue;
+    hasUsableUrl = true;
+    if (!isMp4CompatibleAudio(track)) continue;
     var current = Number(track.bandwidth) || Number(track.id) || 0;
     if (current > score) {
       score = current;
       best = track;
     }
   }
+  if (!best && hasUsableUrl) throw new Error('Bilibili 返回了不兼容 MP4/M4A 封装的音轨');
   return best;
 }
+
+function videoContainer(video) {
+  var mime = mediaMime(video);
+  if (!mime || mime === 'video/mp4') return 'mp4';
+  throw new Error('Bilibili 返回了非 MP4 视频流，当前下载器不能在不转码的情况下封装：' + mime);
+}
+
 
 function videoHeight(video) {
   var height = Number(video.height) || Number(video.height_cm) || 0;
@@ -101,16 +121,17 @@ function buildDashVariants(videos, audio, title, play) {
     var video = item.video;
     var label = videoQualityLabel(video, item.height, play);
     var tag = variantQualityTag({ label: label, qualityId: Number(video.id) || Number(video.quality) || 0, height: item.height });
+    var container = videoContainer(video);
     var variant = {
       label: label,
       url: streamUrl(video),
-      fileName: title + ' [' + tag + '].mp4',
+      fileName: title + ' [' + tag + '].' + container,
       qualityId: Number(video.id) || Number(video.quality) || 0,
       totalBytes: streamSize(video) + streamSize(audio),
       bandwidth: Number(video.bandwidth) || 0,
       width: Number(video.width) || 0,
       height: item.height,
-      container: 'mp4',
+      container: container,
     };
     if (audio) variant.audioUrl = audioUrl(audio);
     variants.push(variant);
@@ -145,6 +166,7 @@ function buildDurlVariants(play, title) {
   for (var i = 0; i < entries.length; i++) {
     var source = entries[i] || {};
     var parts = Array.isArray(source.durl) ? source.durl : [];
+    if (parts.length > 1) throw new Error('Bilibili 返回分段 durl，插件尚不支持完整分段合并；拒绝只下载首段');
     var part = parts[0] || source;
     var url = String(part.url || '');
     var qualityId = Number(source.quality || part.quality || play.quality || 0);
@@ -249,20 +271,21 @@ function buildEpisodeItems(episodes, qualityVariants) {
     }
     if (!added) items.push({ id: 'ep:' + episode.id, name: episode.baseName + '.mp4', path: episode.path, size: 0, kind: 'file' });
   }
-  return items;
+  return fitManifestItems(items);
 }
 
 function chooseDashIndex(variants, quality) {
-  if (!variants.length) return 0;
+  if (!variants.length) throw new Error('Bilibili 未返回可用画质');
   if (quality === 'audio') {
     for (var i = 0; i < variants.length; i++) {
       if (variants[i].height === 0) return i;
     }
-    return 0;
+    throw new Error('Bilibili 当前没有独立音频轨');
   }
   if (quality === 'best') return 0;
-  var target = Number(quality) || 1080;
-  var best = 0;
+  var target = Number(quality);
+  if (!(target > 0)) throw new Error('不支持的画质设置: ' + String(quality));
+  var best = -1;
   var bestHeight = 0;
   for (var j = 0; j < variants.length; j++) {
     var height = Number(variants[j].height) || 0;
@@ -271,6 +294,7 @@ function chooseDashIndex(variants, quality) {
       bestHeight = height;
     }
   }
+  if (best < 0) throw new Error('Bilibili 没有不超过 ' + target + 'p 的可用画质');
   return best;
 }
 
